@@ -45,10 +45,13 @@ Copy `.sample.env` to `.env` and set the **same values as alpalo-v2**:
 ```bash
 pnpm install
 pnpm dev          # http://localhost:3004
-pnpm test         # unit tests (detection + metrics)
 pnpm build        # production build
 pnpm schwab:test  # smoke-test Schwab auth + transactions against shared Redis
 ```
+
+No test suite by design — this repo is kept intentionally light for low-token
+agentic iteration. Verify changes with `pnpm build` (typecheck) and
+`pnpm schwab:test` / `pnpm dev` against real data instead.
 
 ## API
 
@@ -79,7 +82,7 @@ src/
   live/schwabRenewTokens.ts   Token renewal used by the cron
   config/accounts.ts          ACCOUNTS parsing/validation
   lib/redis.ts                Shared Redis helper
-  lib/strategy/               types, normalize, rules, pairing, metrics (+ tests)
+  lib/strategy/               types, normalize, rules, pairing, metrics
   lib/transactions/service.ts Fetch + cache + detect + metrics orchestration
   app/api/trades/route.ts     Dashboard data endpoint
   app/api/cron/token-renew/   Token renewal cron endpoint
