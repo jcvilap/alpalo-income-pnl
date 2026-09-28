@@ -23,7 +23,9 @@ export function formatNumber(value: number, digits = 0): string {
     return value.toFixed(digits);
 }
 
+/** Short display date: "2026-09-25T..." -> "09-25-26". */
 export function formatDate(iso?: string): string {
     if (!iso) return '—';
-    return iso.slice(0, 10);
+    const [year, month, day] = iso.slice(0, 10).split('-');
+    return `${month}-${day}-${year.slice(2)}`;
 }

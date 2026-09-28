@@ -4,13 +4,16 @@ import type { StrategyId } from '@/lib/strategy/types';
 
 export const dynamic = 'force-dynamic';
 
-const SUPPORTED_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR'];
+const SUPPORTED_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR', 'DOUBLE_DIAGONAL'];
 
-/** Parse a strategy query param (case-insensitive, dashes/underscores). */
-function parseStrategy(raw: string | null): StrategyId {
-    if (!raw) return 'DOUBLE_CALENDAR';
-    const normalized = raw.trim().toUpperCase().replace(/-/g, '_') as StrategyId;
-    return SUPPORTED_STRATEGIES.includes(normalized) ? normalized : 'DOUBLE_CALENDAR';
+/** Parse a comma-separated strategy query param (case-insensitive, dashes/underscores). */
+function parseStrategies(raw: string | null): StrategyId[] {
+    if (!raw) return ['DOUBLE_CALENDAR'];
+    const ids = raw
+        .split(',')
+        .map(s => s.trim().toUpperCase().replace(/-/g, '_') as StrategyId)
+        .filter(s => SUPPORTED_STRATEGIES.includes(s));
+    return ids.length > 0 ? Array.from(new Set(ids)) : ['DOUBLE_CALENDAR'];
 }
 
 /** Normalize a date param to an ISO-8601 instant Schwab accepts. */
@@ -23,15 +26,16 @@ function toIso(dateStr: string, endOfDay = false): string {
 }
 
 /**
- * GET /api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD&strategy=double_calendar&refresh=true
+ * GET /api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD&strategy=double_calendar,double_diagonal&refresh=true
  *
- * Returns detected strategy trades + aggregate metrics + equity curve.
- * Defaults the range to year-to-date when from/to are omitted.
+ * Returns detected strategy trades (pooled across all requested strategies) +
+ * aggregate metrics + equity curve. Defaults the range to year-to-date when
+ * from/to are omitted.
  */
 export async function GET(request: Request) {
     try {
         const url = new URL(request.url);
-        const strategy = parseStrategy(url.searchParams.get('strategy'));
+        const strategies = parseStrategies(url.searchParams.get('strategy'));
         const refresh = url.searchParams.get('refresh') === 'true';
 
         const now = new Date();
@@ -41,7 +45,7 @@ export async function GET(request: Request) {
         const from = toIso(url.searchParams.get('from') ?? defaultFrom);
         const to = toIso(url.searchParams.get('to') ?? defaultTo, true);
 
-        const result = await getTrades({ from, to, strategy, refresh });
+        const result = await getTrades({ from, to, strategies, refresh });
         return NextResponse.json(result);
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);

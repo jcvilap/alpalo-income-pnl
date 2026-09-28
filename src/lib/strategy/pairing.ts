@@ -12,11 +12,29 @@ function distinctSorted<T>(values: T[]): T[] {
 
 function toTradeShape(open: StrategyMatch) {
     const legs = open.order.legs;
+    const expirations = distinctSorted(legs.map(l => l.expiration));
     return {
         legs,
         strikes: distinctSorted(legs.map(l => l.strike)),
-        expirations: distinctSorted(legs.map(l => l.expiration)),
+        expirations,
+        dte: nearDte(open.order.time, expirations),
+        contracts: legs.length > 0 ? Math.max(...legs.map(l => Math.abs(l.quantity))) : undefined,
     };
+}
+
+/** Days from the opening order's execution time to its nearest expiration. */
+function nearDte(openedAt: string, expirations: string[]): number | undefined {
+    if (expirations.length === 0) return undefined;
+    try {
+        return Math.max(0, differenceInCalendarDays(parseISO(expirations[0]), parseISO(openedAt)));
+    } catch {
+        return undefined;
+    }
+}
+
+function pctGain(pnl: number | undefined, openNet: number): number | undefined {
+    if (pnl == null || openNet === 0) return undefined;
+    return (pnl / Math.abs(openNet)) * 100;
 }
 
 /**
@@ -70,16 +88,16 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 closeOrderId: match.order.orderId,
                 closedAt: match.order.time,
                 closeNet: match.order.netAmount,
-                realizedPnl: match.order.netAmount,
-                holdDays: 0,
+                pnl: match.order.netAmount,
+                daysOpen: 0,
                 ...shape,
             });
             continue;
         }
 
         const shape = toTradeShape(open);
-        const realizedPnl = open.order.netAmount + match.order.netAmount;
-        const holdDays = safeHoldDays(open.order.time, match.order.time);
+        const pnl = open.order.netAmount + match.order.netAmount;
+        const daysOpen = safeHoldDays(open.order.time, match.order.time);
         trades.push({
             id: `${open.order.orderId}-${match.order.orderId}`,
             strategy: open.strategy,
@@ -91,8 +109,9 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
             closeOrderId: match.order.orderId,
             closedAt: match.order.time,
             closeNet: match.order.netAmount,
-            realizedPnl,
-            holdDays,
+            pnl,
+            pctGain: pctGain(pnl, open.order.netAmount),
+            daysOpen,
             ...shape,
         });
     }
@@ -109,6 +128,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 openOrderId: open.order.orderId,
                 openedAt: open.order.time,
                 openNet: open.order.netAmount,
+                daysOpen: safeHoldDays(open.order.time, new Date().toISOString()),
                 ...shape,
             });
         }

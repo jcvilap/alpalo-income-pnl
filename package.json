@@ -12,6 +12,7 @@
     "schwab:test": "tsx src/scripts/test-schwab.ts"
   },
   "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
     "date-fns": "4.1.0",
     "date-fns-tz": "3.2.0",
     "dotenv": "17.2.3",

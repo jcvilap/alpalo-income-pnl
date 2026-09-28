@@ -52,10 +52,9 @@ next-env.d.ts
 .DS_Store
 Thumbs.db
 
-# AI
+# AI tool-specific config/state (agent instructions live in tracked AGENTS.md)
 .agent
 .gemini
 .claude
 CLAUDE.md
-AGENTS.md
 GEMINI.md

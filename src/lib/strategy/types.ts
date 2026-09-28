@@ -14,6 +14,7 @@ export type OpenClose = 'OPEN' | 'CLOSE';
 /** Known strategy identifiers. Extend this union as new rules are added. */
 export type StrategyId =
     | 'DOUBLE_CALENDAR'
+    | 'DOUBLE_DIAGONAL'
     | 'JADE_LIZARD'
     | 'IRON_CONDOR'
     | 'STRANGLE'
@@ -79,10 +80,21 @@ export interface StrategyTrade {
     /** Net cash of the closing order (positive = credit received to close). */
     closeNet?: number;
 
-    /** Realized P&L = openNet + closeNet. Undefined while open. */
-    realizedPnl?: number;
-    /** Calendar days held (open→close). Undefined while open. */
-    holdDays?: number;
+    /**
+     * P&L: realized (openNet + closeNet) when closed, or a live mark-to-market
+     * estimate (openNet + current value of the open legs) when open.
+     */
+    pnl?: number;
+    /** True when `pnl` is a live estimate (open trade) rather than realized cash. */
+    pnlIsEstimate?: boolean;
+    /** pnl / |openNet| as a percentage, e.g. debit 10 -> credit 11.5 is +15. */
+    pctGain?: number;
+    /** Calendar days held: open->close when closed, open->now when still open. */
+    daysOpen?: number;
+    /** Days to expiration of the near leg, measured from openedAt. */
+    dte?: number;
+    /** Number of contracts traded per leg (max absolute leg quantity at open). */
+    contracts?: number;
 
     /** Human-readable leg summary for the UI. */
     legs: Leg[];
@@ -93,7 +105,7 @@ export interface StrategyTrade {
 }
 
 export interface StrategyMetrics {
-    strategy: StrategyId;
+    strategies: StrategyId[];
     totalTrades: number;
     closedTrades: number;
     openTrades: number;
@@ -106,9 +118,13 @@ export interface StrategyMetrics {
     avgPnl: number;
     avgWin: number;
     avgLoss: number;
-    /** grossProfit / |grossLoss|; Infinity when there are wins but no losses. */
-    profitFactor: number;
+    /** Average pctGain across winning / losing closed trades. Undefined when unavailable (e.g. no cost basis). */
+    avgWinPct?: number;
+    avgLossPct?: number;
     avgHoldDays: number;
     bestTrade: number;
     worstTrade: number;
+    /** pctGain of the single best / worst closed trade by dollar P&L. Undefined when it has no cost basis (e.g. unmatched close). */
+    bestTradePct?: number;
+    worstTradePct?: number;
 }

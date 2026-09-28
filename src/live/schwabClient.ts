@@ -244,13 +244,22 @@ export class SchwabClient {
             if (data) {
 
                 const token: SchwabToken = JSON.parse(data);
+                let dirty = false;
                 if (token.access_token && !token.saved_at) {
                     // Unknown issue date — treat as expired so a refresh is attempted
                     // rather than falsely reporting the token as valid.
                     token.saved_at = Date.now() - (token.expires_in ?? 1800) * 1000;
-                    if (!this.config.readOnly) {
-                        await this.config.redis.set(this.redisKey, JSON.stringify(token));
-                    }
+                    dirty = true;
+                }
+                if (token.refresh_token && !token.refresh_token_saved_at) {
+                    // Unknown issue date (e.g. uploaded by upload-env-to-redis.ts) —
+                    // best guess is that it was just minted, since that script only
+                    // uploads tokens it has just verified live.
+                    token.refresh_token_saved_at = token.saved_at ?? Date.now();
+                    dirty = true;
+                }
+                if (dirty && !this.config.readOnly) {
+                    await this.config.redis.set(this.redisKey, JSON.stringify(token));
                     // readOnly: adjust in memory only, no write back to Redis
                 }
                 return token;
