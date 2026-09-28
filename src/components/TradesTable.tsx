@@ -31,6 +31,7 @@ const STRATEGY_LABELS: Record<StrategyId, string> = {
     JADE_LIZARD: 'Jade Lizard',
     IRON_CONDOR: 'Iron Condor',
     STRANGLE: 'Strangle',
+    LEAPS: 'LEAPS',
     UNKNOWN: 'Unknown',
 };
 

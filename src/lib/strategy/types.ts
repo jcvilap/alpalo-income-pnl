@@ -18,6 +18,7 @@ export type StrategyId =
     | 'JADE_LIZARD'
     | 'IRON_CONDOR'
     | 'STRANGLE'
+    | 'LEAPS'
     | 'UNKNOWN';
 
 /** A single option leg within an order (fees excluded). */

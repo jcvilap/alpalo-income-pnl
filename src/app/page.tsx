@@ -30,7 +30,8 @@ const STRATEGIES = [
     { id: 'double_diagonal', label: 'Double Diagonal', enabled: true },
     { id: 'jade_lizard', label: 'Jade Lizard', enabled: false },
     { id: 'iron_condor', label: 'Iron Condor', enabled: false },
-    { id: 'strangle', label: 'Strangle', enabled: false },
+    { id: 'strangle', label: 'Strangle', enabled: true },
+    { id: 'leaps', label: 'LEAPS', enabled: true },
 ];
 
 const RANGE_PRESETS = [

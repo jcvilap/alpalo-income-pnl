@@ -129,10 +129,75 @@ export const DOUBLE_DIAGONAL_RULE: StrategyRule = {
     },
 };
 
+/** A year, in days, for the LEAPS long-dated threshold. */
+const LEAPS_MIN_DAYS = 365;
+
+/**
+ * LEAPS: a single-leg order (one call or put, bought or sold) with an
+ * expiration more than a year out from the order's execution time. LEAPS
+ * positions are sometimes rolled (closed and reopened at a new strike/
+ * expiration), but this rule doesn't chain rolls together — a roll shows up
+ * as one FIFO-paired trade closing and a new one opening, same as any other
+ * strategy here. See `legSetSignature` / `buildTrades` in pairing.ts.
+ */
+export const LEAPS_RULE: StrategyRule = {
+    id: 'LEAPS',
+    name: 'LEAPS',
+    matches(order: OrderGroup): boolean {
+        if (order.legs.length !== 1) return false;
+        const [leg] = order.legs;
+        const days = daysBetween(order.time, leg.expiration);
+        return days != null && days > LEAPS_MIN_DAYS;
+    },
+};
+
+function daysBetween(fromIso: string, toDateStr: string): number | null {
+    const from = new Date(fromIso);
+    const to = new Date(`${toDateStr}T00:00:00.000Z`);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return null;
+    return (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000);
+}
+
+/**
+ * Strangle: one call + one put, same underlying, same expiration, different
+ * strikes, opened in a single 2-leg order (the "made in a single transaction"
+ * requirement). Only matches whole-order shapes — this rule does NOT detect a
+ * lone leg closing independently of its partner, since a single-leg CLOSE
+ * order is structurally indistinguishable from a LEAPS close or naked-option
+ * close by shape alone. Practical effect: a strangle whose two legs are
+ * closed in separate orders will never re-match this 2-leg shape on close,
+ * so `buildTrades`'s FIFO pairing won't find a closing match and the trade
+ * will show as permanently 'open' with an estimated (not realized) P&L. Only
+ * strangles closed both-legs-in-one-order will resolve to 'closed'. Fixing
+ * the independent-leg-close case requires per-leg pairing state in
+ * pairing.ts, not just a shape rule — flagged as a known follow-up.
+ */
+export const STRANGLE_RULE: StrategyRule = {
+    id: 'STRANGLE',
+    name: 'Strangle',
+    matches(order: OrderGroup): boolean {
+        const legs = order.legs;
+        if (legs.length !== 2) return false;
+
+        const calls = legs.filter(l => l.right === 'CALL');
+        const puts = legs.filter(l => l.right === 'PUT');
+        if (calls.length !== 1 || puts.length !== 1) return false;
+
+        const [call] = calls;
+        const [put] = puts;
+        if (call.expiration !== put.expiration) return false;
+        if (call.strike === put.strike) return false;
+
+        return true;
+    },
+};
+
 /** Registry of active strategy rules. Order = detection priority. */
 export const STRATEGY_RULES: StrategyRule[] = [
     DOUBLE_CALENDAR_RULE,
     DOUBLE_DIAGONAL_RULE,
+    STRANGLE_RULE,
+    LEAPS_RULE,
 ];
 
 /**
