@@ -9,11 +9,10 @@
     "dev": "next dev -p 3004",
     "build": "next build",
     "start": "next start",
-    "test": "vitest run",
-    "test:watch": "vitest",
     "schwab:test": "tsx src/scripts/test-schwab.ts"
   },
   "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
     "date-fns": "4.1.0",
     "date-fns-tz": "3.2.0",
     "dotenv": "17.2.3",
@@ -32,8 +31,7 @@
     "@types/react-dom": "19.2.3",
     "tailwindcss": "4.1.17",
     "tsx": "4.20.6",
-    "typescript": "5.9.3",
-    "vitest": "4.1.6"
+    "typescript": "5.9.3"
   },
   "pnpm": {
     "overrides": {

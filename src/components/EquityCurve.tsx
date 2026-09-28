@@ -36,6 +36,10 @@ export function EquityCurve({ data }: { data: Point[] }) {
 
     const hue = 'var(--color-chart-blue)';
 
+    // Prepend a $0 baseline point so the curve visibly starts from zero
+    // instead of jumping straight to the first trade's P&L.
+    const chartData: Point[] = [{ date: data[0].date, pnl: 0, cumulative: 0 }, ...data];
+
     return (
         <div
             className="rounded-xl p-4 bg-surface transition-theme"
@@ -46,7 +50,7 @@ export function EquityCurve({ data }: { data: Point[] }) {
             </h3>
             <div style={{ width: '100%', height: 280 }}>
                 <ResponsiveContainer>
-                    <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
+                    <AreaChart data={chartData} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
                         <defs>
                             <linearGradient id="pnlFill" x1="0" y1="0" x2="0" y2="1">
                                 <stop offset="0%" stopColor={hue} stopOpacity={0.28} />
@@ -66,6 +70,7 @@ export function EquityCurve({ data }: { data: Point[] }) {
                             tickLine={false}
                             axisLine={false}
                             width={70}
+                            domain={[(min: number) => Math.min(0, min), (max: number) => Math.max(0, max)]}
                             tickFormatter={(v) => formatCurrency(v)}
                         />
                         <Tooltip

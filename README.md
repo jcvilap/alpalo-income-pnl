@@ -2,11 +2,13 @@
 
 A Vercel-hosted Next.js dashboard that queries **Charles Schwab** transactions,
 identifies which manual option-income strategy each order belongs to, and
-computes P&L metrics (win rate, avg profit, profit factor, …).
+computes P&L metrics (win rate, avg win/loss, best/worst trade, …).
 
-**Current scope: double calendars.** The detection layer is rule-based, so
-jade lizards, iron condors, and strangles can be added later by adding a rule —
-no engine changes.
+**Current scope: double calendars + double diagonals.** The detection layer
+is rule-based, so jade lizards, iron condors, and strangles can be added
+later by adding a rule — no engine changes. The dashboard's strategy filter
+is a multiselect; selected strategies are pooled into one combined view
+(trades, stat tiles, equity curve all sum across the selection).
 
 ## How it works
 
@@ -20,10 +22,26 @@ Schwab /transactions  →  normalize (group by orderId)  →  classify (strategy
 - **Realized P&L** of a completed trade = `netAmount(open order) + netAmount(close order)`.
   Schwab does not return realized P&L on transactions; it's computed from the
   signed net cash of the paired orders (debits negative, credits positive),
-  which already includes commissions/fees.
-- **Double calendar (strict):** one call calendar + one put calendar on the same
-  underlying, same near/far expiration pair, different strikes — 4 legs total.
-  See `src/lib/strategy/rules.ts`.
+  which already includes commissions/fees. `pctGain = pnl / |openNet| * 100`.
+- **Unrealized P&L** for still-open trades is a live mark-to-market estimate:
+  `openNet + Σ(leg.quantity * quote.mark * 100)` using `SchwabClient.getQuotes`.
+  Flagged with `pnlIsEstimate: true` (shown as `*` in the table). See
+  `applyUnrealizedPnl` in `lib/transactions/service.ts` for the sign-convention
+  derivation — it's easy to get backwards, don't re-derive it without reading
+  that comment first.
+- **Double calendar (strict):** one call calendar + one put calendar, same
+  underlying, same near/far expiration pair, 2 distinct strikes (near=far
+  strike within each leg pair) — 4 legs total.
+- **Double diagonal (strict):** same shape as a double calendar, but each
+  leg pair's near/far strikes differ — 4 distinct strikes total instead of 2.
+  Both rules share `matchDoubleTimeSpread` in `src/lib/strategy/rules.ts`.
+- **Lookback widening:** every fetch pulls Schwab's full ~1-year lookback
+  ending at `to`, regardless of the user's selected `from` — a trade's
+  opening order can sit before the visible window, and without the wider
+  fetch we can't find it and wrongly treat the close as a $0-cost-basis
+  windfall. Only trades whose open or close falls in `[from, to]` are
+  displayed; the fetched-but-hidden data exists purely to resolve real cost
+  basis. See `clampLookback` / `tradeInRange` in `lib/transactions/service.ts`.
 
 ## Credentials — shared with `alpalo-v2`
 
@@ -40,21 +58,47 @@ Copy `.sample.env` to `.env` and set the **same values as alpalo-v2**:
 | `ACCOUNTS` | JSON array with the Schwab entry (client id/secret, tokens, account hash). Must match alpalo-v2. |
 | `CRON_SECRET` | Protects `/api/cron/token-renew`. |
 
+**Gotcha:** Schwab refresh tokens expire after 7 days. If `pnpm schwab:test`
+fails with `invalid_grant`, the shared refresh token has expired — reauth via
+alpalo-v2's `pnpm reauth-schwab` script (interactive browser login), which
+seeds fresh tokens into the shared Redis. This project cannot mint its own
+tokens; it only ever reads/refreshes what alpalo-v2 (or a manual reauth)
+seeded. Also: tokens written by alpalo-v2's `upload-env-to-redis.ts` omit
+`refresh_token_saved_at`; `loadTokenFromRedis` in `src/live/schwabClient.ts`
+backfills it on load so `getRefreshTokenRemainingDays()` doesn't misreport
+`0.0d` for a token that's actually fresh.
+
+## Auth
+
+`src/components/LoginGate.tsx` wraps the dashboard with a hardcoded
+`admin`/`123` check, gated on `sessionStorage`. This is a screen-privacy
+speed bump, **not real authentication** — the API routes underneath remain
+unauthenticated. Don't treat it as a security boundary.
+
 ## Develop
 
 ```bash
 pnpm install
 pnpm dev          # http://localhost:3004
-pnpm test         # unit tests (detection + metrics)
 pnpm build        # production build
 pnpm schwab:test  # smoke-test Schwab auth + transactions against shared Redis
 ```
 
+No test suite by design — this repo is kept intentionally light for low-token
+agentic iteration. Verify changes with `pnpm build` (typecheck) and
+`pnpm schwab:test` / `pnpm dev` against real data instead. Redis caches trade
+results for ~15 min (see `RAW_TTL_SECONDS`/`PARSED_TTL_SECONDS` in
+`lib/transactions/service.ts`) — pass `refresh=true` or bump `STRATEGY_VERSION`
+after changing detection/normalization/pairing logic, or you'll be debugging
+against stale cached output.
+
 ## API
 
-- `GET /api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD&strategy=double_calendar[&refresh=true]`
-  → `{ trades, metrics, equityCurve, cached }`. Range defaults to YTD.
-  Results are cached in Redis (~15 min); `refresh=true` bypasses the cache.
+- `GET /api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD&strategy=double_calendar,double_diagonal[&refresh=true]`
+  → `{ strategies, trades, metrics, equityCurve, cached, fetchedAt }`.
+  `strategy` is a comma-separated list (case-insensitive, `-`/`_` interchangeable);
+  unrecognized ids are dropped. Range defaults to YTD. Results are cached in
+  Redis (~15 min); `refresh=true` bypasses the cache.
 - `GET /api/cron/token-renew` → renews Schwab tokens (safety net).
   Requires `Authorization: Bearer $CRON_SECRET`. Add `?seed=true` to push fresh
   tokens from `ACCOUNTS` into Redis after a manual re-authorization.
@@ -66,8 +110,12 @@ Scheduled daily via `vercel.json`.
 1. Add a `StrategyRule` in `src/lib/strategy/rules.ts` implementing `matches()`
    against an `OrderGroup`'s legs, and register it in `STRATEGY_RULES`.
 2. Add its id to the `StrategyId` union in `src/lib/strategy/types.ts`.
-3. Enable it in the dashboard's strategy selector (`src/app/page.tsx`) and the
-   API allow-list (`src/app/api/trades/route.ts`).
+3. Enable it in the dashboard's strategy multiselect (`STRATEGIES` in
+   `src/app/page.tsx`, set `enabled: true`) and the API allow-list
+   (`SUPPORTED_STRATEGIES` in `src/app/api/trades/route.ts`).
+4. Add its display label to `STRATEGY_LABELS` in `src/components/TradesTable.tsx`.
+5. Bump `STRATEGY_VERSION` in `src/lib/transactions/service.ts` to invalidate
+   stale cached trade lists (they won't have the new strategy classified).
 
 Pairing and metrics are strategy-agnostic and need no changes.
 
@@ -75,14 +123,21 @@ Pairing and metrics are strategy-agnostic and need no changes.
 
 ```
 src/
-  live/schwabClient.ts        Schwab OAuth2 client (+ getTransactions), Redis-backed tokens
+  live/schwabClient.ts        Schwab OAuth2 client (transactions, quotes), Redis-backed tokens
   live/schwabRenewTokens.ts   Token renewal used by the cron
   config/accounts.ts          ACCOUNTS parsing/validation
   lib/redis.ts                Shared Redis helper
-  lib/strategy/               types, normalize, rules, pairing, metrics (+ tests)
-  lib/transactions/service.ts Fetch + cache + detect + metrics orchestration
-  app/api/trades/route.ts     Dashboard data endpoint
-  app/api/cron/token-renew/   Token renewal cron endpoint
-  app/page.tsx                Dashboard UI
-  components/                 StatTile, EquityCurve, TradesTable, ThemeToggle
+  lib/format.ts                Currency/percent/date display formatters
+  lib/strategy/                types, normalize, rules, pairing, metrics
+  lib/transactions/service.ts  Fetch + cache + widen-lookback + detect + unrealized-P&L + metrics
+  app/api/trades/route.ts      Dashboard data endpoint (multi-strategy query parsing)
+  app/api/cron/token-renew/    Token renewal cron endpoint
+  app/page.tsx                 Dashboard UI: strategy multiselect, date presets, stat tiles
+  components/                  LoginGate, StatTile, EquityCurve, TradesTable, ThemeToggle
 ```
+
+`TradesTable.tsx` uses `@tanstack/react-table` (headless) for sort/filter/group/
+column-pinning — `% Gain` is pinned right; if you pin another column, remember
+TanStack returns headers/cells in column-definition order regardless of pin
+state, so the render code reorders them via `orderByPinning` before mapping,
+or pinned columns will visually overlap unpinned ones.

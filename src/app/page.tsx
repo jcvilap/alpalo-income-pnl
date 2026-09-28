@@ -1,16 +1,22 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { Activity, RefreshCw, TrendingUp } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Activity, ChevronDown, RefreshCw, TrendingUp } from 'lucide-react';
 import { StatTile } from '@/components/StatTile';
 import { EquityCurve } from '@/components/EquityCurve';
 import { TradesTable } from '@/components/TradesTable';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { LoginGate } from '@/components/LoginGate';
 import type { StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 import { formatCurrency, formatNumber, formatPercent } from '@/lib/format';
 
+function formatSignedPercent(pct: number | undefined): string {
+    if (pct == null) return '—';
+    return `${pct > 0 ? '+' : ''}${pct.toFixed(1)}%`;
+}
+
 interface TradesResponse {
-    strategy: string;
+    strategies: string[];
     range: { from: string; to: string };
     trades: StrategyTrade[];
     metrics: StrategyMetrics;
@@ -21,34 +27,76 @@ interface TradesResponse {
 
 const STRATEGIES = [
     { id: 'double_calendar', label: 'Double Calendar', enabled: true },
+    { id: 'double_diagonal', label: 'Double Diagonal', enabled: true },
     { id: 'jade_lizard', label: 'Jade Lizard', enabled: false },
     { id: 'iron_condor', label: 'Iron Condor', enabled: false },
     { id: 'strangle', label: 'Strangle', enabled: false },
 ];
 
-function ytdDefaults() {
+const RANGE_PRESETS = [
+    { id: '1W', label: '1W', days: 7 },
+    { id: '1M', label: '1M', days: 30 },
+    { id: '2M', label: '2M', days: 60 },
+    { id: '3M', label: '3M', days: 90 },
+    { id: '4M', label: '4M', days: 120 },
+    { id: '5M', label: '5M', days: 150 },
+    { id: '6M', label: '6M', days: 180 },
+    { id: 'YTD', label: 'YTD', days: null },
+    { id: 'ALL', label: 'ALL', days: null },
+    { id: 'CUSTOM', label: 'Custom', days: null },
+] as const;
+
+type RangePresetId = (typeof RANGE_PRESETS)[number]['id'];
+
+/** Schwab's /transactions endpoint rejects ranges wider than ~1 year, so "ALL" means that. */
+const SCHWAB_MAX_LOOKBACK_DAYS = 364;
+
+function toDateStr(d: Date) {
+    return d.toISOString().slice(0, 10);
+}
+
+function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
     const now = new Date();
-    return {
-        from: `${now.getFullYear()}-01-01`,
-        to: now.toISOString().slice(0, 10),
-    };
+    const to = toDateStr(now);
+    const found = RANGE_PRESETS.find((p) => p.id === preset);
+
+    if (preset === 'YTD') {
+        return { from: `${now.getFullYear()}-01-01`, to };
+    }
+    if (preset === 'ALL') {
+        const from = new Date(now.getTime() - SCHWAB_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+        return { from: toDateStr(from), to };
+    }
+    if (found?.days) {
+        const from = new Date(now.getTime() - found.days * 24 * 60 * 60 * 1000);
+        return { from: toDateStr(from), to };
+    }
+    // CUSTOM — caller keeps whatever from/to is already selected.
+    return { from: `${now.getFullYear()}-01-01`, to };
 }
 
 export default function Home() {
-    const defaults = ytdDefaults();
+    const defaults = rangeForPreset('YTD');
+    const [preset, setPreset] = useState<RangePresetId>('YTD');
     const [from, setFrom] = useState(defaults.from);
     const [to, setTo] = useState(defaults.to);
-    const [strategy, setStrategy] = useState('double_calendar');
+    const [strategies, setStrategies] = useState<string[]>(['double_calendar']);
+    const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
+    const strategyMenuRef = useRef<HTMLDivElement>(null);
     const [data, setData] = useState<TradesResponse | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const load = useCallback(
-        async (refresh = false) => {
+        async (refresh = false, overrideFrom?: string, overrideTo?: string, overrideStrategies?: string[]) => {
             setLoading(true);
             setError(null);
             try {
-                const params = new URLSearchParams({ from, to, strategy });
+                const params = new URLSearchParams({
+                    from: overrideFrom ?? from,
+                    to: overrideTo ?? to,
+                    strategy: (overrideStrategies ?? strategies).join(','),
+                });
                 if (refresh) params.set('refresh', 'true');
                 const res = await fetch(`/api/trades?${params.toString()}`);
                 const json = await res.json();
@@ -61,7 +109,7 @@ export default function Home() {
                 setLoading(false);
             }
         },
-        [from, to, strategy],
+        [from, to, strategies],
     );
 
     useEffect(() => {
@@ -69,9 +117,53 @@ export default function Home() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    useEffect(() => {
+        if (!strategyMenuOpen) return;
+        const onClickOutside = (e: MouseEvent) => {
+            if (strategyMenuRef.current && !strategyMenuRef.current.contains(e.target as Node)) {
+                setStrategyMenuOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', onClickOutside);
+        return () => document.removeEventListener('mousedown', onClickOutside);
+    }, [strategyMenuOpen]);
+
+    const selectPreset = useCallback(
+        (id: RangePresetId) => {
+            setPreset(id);
+            if (id !== 'CUSTOM') {
+                const range = rangeForPreset(id);
+                setFrom(range.from);
+                setTo(range.to);
+                void load(false, range.from, range.to, strategies);
+            }
+        },
+        [load, strategies],
+    );
+
+    const toggleStrategy = useCallback(
+        (id: string) => {
+            setStrategies((prev) => {
+                const next = prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id];
+                const applied = next.length > 0 ? next : prev;
+                void load(false, from, to, applied);
+                return applied;
+            });
+        },
+        [load, from, to],
+    );
+
     const m = data?.metrics;
+    const enabledStrategies = STRATEGIES.filter((s) => s.enabled);
+    const strategyLabel =
+        strategies.length === 0
+            ? 'Select strategy'
+            : strategies.length === enabledStrategies.length
+              ? 'All strategies'
+              : strategies.map((id) => STRATEGIES.find((s) => s.id === id)?.label ?? id).join(', ');
 
     return (
+        <LoginGate>
         <main
             className="min-h-screen px-4 py-6 sm:px-8 sm:py-10 transition-theme"
             style={{ background: 'var(--color-background)' }}
@@ -85,7 +177,7 @@ export default function Home() {
                             Alpalo Income P&amp;L
                         </h1>
                         <p className="text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
-                            Schwab option-income strategy analytics
+                            Analyze current income generating strategies
                         </p>
                     </div>
                     <ThemeToggle />
@@ -97,38 +189,86 @@ export default function Home() {
                     style={{ border: '1px solid var(--color-border)' }}
                 >
                     <Field label="Strategy">
-                        <select
-                            value={strategy}
-                            onChange={(e) => setStrategy(e.target.value)}
-                            className="rounded-lg px-3 py-2 text-sm bg-surface"
-                            style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
-                        >
-                            {STRATEGIES.map((s) => (
-                                <option key={s.id} value={s.id} disabled={!s.enabled}>
-                                    {s.label}
-                                    {!s.enabled ? ' (soon)' : ''}
-                                </option>
+                        <div className="relative" ref={strategyMenuRef}>
+                            <button
+                                type="button"
+                                onClick={() => setStrategyMenuOpen((v) => !v)}
+                                className="rounded-lg px-3 text-sm bg-surface h-9 flex items-center gap-2 min-w-[160px] justify-between"
+                                style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
+                            >
+                                <span className="truncate">{strategyLabel}</span>
+                                <ChevronDown size={14} style={{ color: 'var(--color-text-tertiary)' }} />
+                            </button>
+                            {strategyMenuOpen && (
+                                <div
+                                    className="absolute z-10 mt-1 rounded-lg p-1.5 bg-surface shadow-lg min-w-[200px]"
+                                    style={{ border: '1px solid var(--color-border)' }}
+                                >
+                                    {STRATEGIES.map((s) => (
+                                        <label
+                                            key={s.id}
+                                            className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-sm ${
+                                                s.enabled ? 'cursor-pointer hover:opacity-80' : 'cursor-not-allowed opacity-50'
+                                            }`}
+                                            style={{ color: 'var(--color-text-primary)' }}
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={strategies.includes(s.id)}
+                                                disabled={!s.enabled}
+                                                onChange={() => toggleStrategy(s.id)}
+                                            />
+                                            {s.label}
+                                            {!s.enabled ? ' (soon)' : ''}
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </Field>
+                    <Field label="Range">
+                        <div className="flex flex-wrap gap-1">
+                            {RANGE_PRESETS.map((p) => (
+                                <button
+                                    key={p.id}
+                                    onClick={() => selectPreset(p.id)}
+                                    className="rounded-lg px-2.5 text-xs font-medium transition-theme h-9"
+                                    style={
+                                        preset === p.id
+                                            ? { background: 'var(--color-primary)', color: 'white' }
+                                            : {
+                                                  border: '1px solid var(--color-border)',
+                                                  color: 'var(--color-text-secondary)',
+                                              }
+                                    }
+                                >
+                                    {p.label}
+                                </button>
                             ))}
-                        </select>
+                        </div>
                     </Field>
-                    <Field label="From">
-                        <DateInput value={from} onChange={setFrom} />
-                    </Field>
-                    <Field label="To">
-                        <DateInput value={to} onChange={setTo} />
-                    </Field>
-                    <button
-                        onClick={() => load(false)}
-                        disabled={loading}
-                        className="rounded-lg px-4 py-2 text-sm font-medium text-white bg-gradient-button hover:bg-gradient-button-hover disabled:opacity-60"
-                    >
-                        {loading ? 'Loading…' : 'Apply'}
-                    </button>
+                    {preset === 'CUSTOM' && (
+                        <>
+                            <Field label="From">
+                                <DateInput value={from} onChange={setFrom} />
+                            </Field>
+                            <Field label="To">
+                                <DateInput value={to} onChange={setTo} />
+                            </Field>
+                            <button
+                                onClick={() => load(false)}
+                                disabled={loading}
+                                className="rounded-lg px-4 text-sm font-medium text-white bg-gradient-button hover:bg-gradient-button-hover disabled:opacity-60 h-9"
+                            >
+                                {loading ? 'Loading…' : 'Apply'}
+                            </button>
+                        </>
+                    )}
                     <button
                         onClick={() => load(true)}
                         disabled={loading}
                         title="Bypass cache and re-fetch from Schwab"
-                        className="rounded-lg px-3 py-2 text-sm font-medium flex items-center gap-1.5 disabled:opacity-60"
+                        className="rounded-lg px-3 text-sm font-medium flex items-center gap-1.5 disabled:opacity-60 h-9"
                         style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
                     >
                         <RefreshCw size={14} className={loading ? 'animate-spin-slow' : ''} />
@@ -165,17 +305,34 @@ export default function Home() {
                             value={formatCurrency(m.avgPnl, { sign: true })}
                             tone={m.avgPnl > 0 ? 'positive' : m.avgPnl < 0 ? 'negative' : 'neutral'}
                         />
-                        <StatTile label="Profit Factor" value={formatNumber(m.profitFactor, 2)} />
                         <StatTile
                             label="Closed / Open"
                             value={`${m.closedTrades} / ${m.openTrades}`}
                             hint={`avg hold ${formatNumber(m.avgHoldDays, 0)}d`}
                         />
                         <StatTile
-                            label="Best / Worst"
+                            label="Avg Win"
+                            value={formatCurrency(m.avgWin, { sign: true })}
+                            hint={`${formatSignedPercent(m.avgWinPct)}`}
+                            tone="positive"
+                        />
+                        <StatTile
+                            label="Avg Loss"
+                            value={formatCurrency(m.avgLoss, { sign: true })}
+                            hint={`${formatSignedPercent(m.avgLossPct)}`}
+                            tone="negative"
+                        />
+                        <StatTile
+                            label="Biggest Win"
                             value={formatCurrency(m.bestTrade, { sign: true })}
-                            hint={formatCurrency(m.worstTrade, { sign: true })}
-                            tone="neutral"
+                            hint={`${formatSignedPercent(m.bestTradePct)}`}
+                            tone="positive"
+                        />
+                        <StatTile
+                            label="Biggest Loss"
+                            value={formatCurrency(m.worstTrade, { sign: true })}
+                            hint={`${formatSignedPercent(m.worstTradePct)}`}
+                            tone="negative"
                         />
                     </section>
                 )}
@@ -188,11 +345,12 @@ export default function Home() {
 
                 {!data && !error && !loading && (
                     <div className="text-center text-sm py-12" style={{ color: 'var(--color-text-tertiary)' }}>
-                        Choose a range and click Apply.
+                        Choose a range to load trades.
                     </div>
                 )}
             </div>
         </main>
+        </LoginGate>
     );
 }
 
@@ -213,7 +371,7 @@ function DateInput({ value, onChange }: { value: string; onChange: (v: string) =
             type="date"
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            className="rounded-lg px-3 py-2 text-sm bg-surface"
+            className="rounded-lg px-3 text-sm bg-surface h-9"
             style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
         />
     );

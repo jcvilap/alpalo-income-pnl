@@ -12,29 +12,33 @@ export interface StrategyRule {
     matches(order: OrderGroup): boolean;
 }
 
-/** One "calendar": same right + same strike, two expirations, a near short + a far long. */
-interface Calendar {
+/**
+ * One "time spread": same right, two expirations, a near short + a far long,
+ * each at its own strike. When both strikes are equal it's a calendar; when
+ * they differ it's a diagonal.
+ */
+interface TimeSpread {
     right: OptionRight;
-    strike: number;
+    nearStrike: number;
+    farStrike: number;
     nearExpiration: string;
     farExpiration: string;
 }
 
 /**
- * Identify a calendar spread among legs of a single right.
+ * Identify a calendar or diagonal spread among legs of a single right.
  *
- * A calendar requires exactly one strike, exactly two expirations, with a short
- * leg on the near expiration and a long leg on the far expiration. Sign of
- * quantity distinguishes long (+) from short (-). This holds for both the
- * opening order (sell near / buy far) and the closing order (buy near / sell
- * far) because we key off strike/expiration structure, and require one long +
- * one short across the two expirations.
+ * Requires exactly two legs of the same right, on two distinct expirations,
+ * with a short leg on the near expiration and a long leg on the far
+ * expiration. Sign of quantity distinguishes long (+) from short (-). This
+ * holds for both the opening order (sell near / buy far) and the closing
+ * order (buy near / sell far) because we key off strike/expiration structure,
+ * and require one long + one short across the two expirations. Strikes may
+ * be equal (calendar) or different (diagonal) — callers decide which shape
+ * they need.
  */
-function detectCalendar(legsOfRight: Leg[]): Calendar | null {
+function detectTimeSpread(legsOfRight: Leg[]): TimeSpread | null {
     if (legsOfRight.length !== 2) return null;
-
-    const strikes = new Set(legsOfRight.map(l => l.strike));
-    if (strikes.size !== 1) return null;
 
     const expirations = Array.from(new Set(legsOfRight.map(l => l.expiration))).sort();
     if (expirations.length !== 2) return null;
@@ -49,10 +53,38 @@ function detectCalendar(legsOfRight: Leg[]): Calendar | null {
 
     return {
         right: legsOfRight[0].right,
-        strike: legsOfRight[0].strike,
+        nearStrike: nearLeg.strike,
+        farStrike: farLeg.strike,
         nearExpiration: near,
         farExpiration: far,
     };
+}
+
+/** Shared 4-leg (2 calls + 2 puts) time-spread shape check for the double-calendar/diagonal rules. */
+function matchDoubleTimeSpread(
+    order: OrderGroup,
+    strikeShape: (spread: TimeSpread) => boolean,
+    crossPairShape: (callSpread: TimeSpread, putSpread: TimeSpread) => boolean,
+): boolean {
+    const legs = order.legs;
+    if (legs.length !== 4) return false;
+
+    const calls = legs.filter(l => l.right === 'CALL');
+    const puts = legs.filter(l => l.right === 'PUT');
+    if (calls.length !== 2 || puts.length !== 2) return false;
+
+    const callSpread = detectTimeSpread(calls);
+    const putSpread = detectTimeSpread(puts);
+    if (!callSpread || !putSpread) return false;
+
+    if (!strikeShape(callSpread) || !strikeShape(putSpread)) return false;
+    if (!crossPairShape(callSpread, putSpread)) return false;
+
+    // Both spreads should share the same near/far expiration pair.
+    if (callSpread.nearExpiration !== putSpread.nearExpiration) return false;
+    if (callSpread.farExpiration !== putSpread.farExpiration) return false;
+
+    return true;
 }
 
 /**
@@ -63,31 +95,44 @@ export const DOUBLE_CALENDAR_RULE: StrategyRule = {
     id: 'DOUBLE_CALENDAR',
     name: 'Double Calendar',
     matches(order: OrderGroup): boolean {
-        const legs = order.legs;
-        if (legs.length !== 4) return false;
+        return matchDoubleTimeSpread(
+            order,
+            (spread) => spread.nearStrike === spread.farStrike,
+            (callSpread, putSpread) => callSpread.nearStrike !== putSpread.nearStrike,
+        );
+    },
+};
 
-        const calls = legs.filter(l => l.right === 'CALL');
-        const puts = legs.filter(l => l.right === 'PUT');
-        if (calls.length !== 2 || puts.length !== 2) return false;
-
-        const callCal = detectCalendar(calls);
-        const putCal = detectCalendar(puts);
-        if (!callCal || !putCal) return false;
-
-        // Distinct strikes for the two calendars (classic double calendar).
-        if (callCal.strike === putCal.strike) return false;
-
-        // Both calendars should share the same near/far expiration pair.
-        if (callCal.nearExpiration !== putCal.nearExpiration) return false;
-        if (callCal.farExpiration !== putCal.farExpiration) return false;
-
-        return true;
+/**
+ * Strict double diagonal: one call diagonal + one put diagonal on the same
+ * underlying, opened/closed in a single order. Like a double calendar, but
+ * each diagonal's near/far legs sit at different strikes — 4 distinct strikes
+ * total instead of 2.
+ */
+export const DOUBLE_DIAGONAL_RULE: StrategyRule = {
+    id: 'DOUBLE_DIAGONAL',
+    name: 'Double Diagonal',
+    matches(order: OrderGroup): boolean {
+        return matchDoubleTimeSpread(
+            order,
+            (spread) => spread.nearStrike !== spread.farStrike,
+            (callSpread, putSpread) => {
+                const strikes = new Set([
+                    callSpread.nearStrike,
+                    callSpread.farStrike,
+                    putSpread.nearStrike,
+                    putSpread.farStrike,
+                ]);
+                return strikes.size === 4;
+            },
+        );
     },
 };
 
 /** Registry of active strategy rules. Order = detection priority. */
 export const STRATEGY_RULES: StrategyRule[] = [
     DOUBLE_CALENDAR_RULE,
+    DOUBLE_DIAGONAL_RULE,
 ];
 
 /**
