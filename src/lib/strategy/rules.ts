@@ -227,20 +227,60 @@ export function legSetSignature(order: OrderGroup): string {
     return `${order.underlying}|${parts.join(',')}`;
 }
 
+/** A fill's cash impact per Schwab's convention (see AGENTS.md): -quantity * price * 100. */
+function legNetAmount(leg: Leg): number {
+    return -leg.quantity * leg.price * 100;
+}
+
 /**
- * Classify a single order against the rule registry. Returns the first matching
- * strategy, or null if none match (order is filtered out of the dashboard).
+ * Classify a single order against the rule registry. Returns every matching
+ * strategy found in the order, or `[]` if none match (order is filtered out
+ * of the dashboard).
+ *
+ * Tries the whole order first (double calendars/diagonals/strangles are only
+ * ever meaningful as a whole multi-leg unit). If nothing matches the order as
+ * a whole and it has more than one leg, falls back to classifying each leg
+ * independently as its own synthetic single-leg order — this recovers cases
+ * where Schwab batches economically-unrelated single-leg trades (e.g. opening
+ * a new LEAPS while closing an unrelated short-dated put) under one shared
+ * orderId. Without this fallback, that whole order — including the
+ * legitimate LEAPS leg — would silently vanish from every strategy view.
  */
-export function classifyOrder(order: OrderGroup): StrategyMatch | null {
+export function classifyOrder(order: OrderGroup): StrategyMatch[] {
     for (const rule of STRATEGY_RULES) {
         if (rule.matches(order)) {
-            return {
+            return [{
                 strategy: rule.id,
                 order,
                 side: orderSide(order),
                 signature: legSetSignature(order),
-            };
+            }];
         }
     }
-    return null;
+
+    if (order.legs.length <= 1) return [];
+
+    // Fallback: try each leg as its own independent single-leg order.
+    const matches: StrategyMatch[] = [];
+    for (const leg of order.legs) {
+        const legOrder: OrderGroup = {
+            orderId: order.orderId,
+            time: order.time,
+            underlying: leg.underlying,
+            legs: [leg],
+            netAmount: legNetAmount(leg),
+        };
+        for (const rule of STRATEGY_RULES) {
+            if (rule.matches(legOrder)) {
+                matches.push({
+                    strategy: rule.id,
+                    order: legOrder,
+                    side: leg.openClose,
+                    signature: legSetSignature(legOrder),
+                });
+                break;
+            }
+        }
+    }
+    return matches;
 }

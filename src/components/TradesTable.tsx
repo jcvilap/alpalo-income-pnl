@@ -135,16 +135,20 @@ const columns: ColumnDef<StrategyTrade>[] = [
     {
         accessorKey: 'expirations',
         header: 'Expirations',
-        cell: (ctx) => (
-            <span className="tabular-nums text-xs">
-                {ctx.getValue<string[]>().map((e) => formatDate(e)).join(' / ')}
-            </span>
-        ),
+        cell: (ctx) => {
+            const expirations = ctx.getValue<string[]>();
+            const dtes = ctx.row.original.expirationDtes;
+            return (
+                <span className="tabular-nums text-xs">
+                    {expirations.map((e, i) => `${formatDate(e)} (${dtes[i] ?? '—'}d)`).join(' / ')}
+                </span>
+            );
+        },
         enableSorting: false,
     },
     {
         accessorKey: 'dte',
-        header: 'DTE',
+        header: 'DTE Left',
         cell: (ctx) => <span className="tabular-nums">{ctx.getValue<number | undefined>() ?? '—'}</span>,
     },
     {

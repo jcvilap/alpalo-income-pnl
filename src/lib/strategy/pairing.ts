@@ -17,7 +17,11 @@ function toTradeShape(open: StrategyMatch, contracts?: number) {
         legs,
         strikes: distinctSorted(legs.map(l => l.strike)),
         expirations,
-        dte: nearDte(open.order.time, expirations),
+        expirationDtes: expirations.map(e => daysAt(open.order.time, e)),
+        // `dte` (remaining days to expiration) is intentionally left unset
+        // here — it depends on "now", not the open time, so it must be
+        // computed fresh on every request. See `applyRemainingDte` in
+        // lib/transactions/service.ts.
         contracts: contracts ?? matchContracts(open),
     };
 }
@@ -35,13 +39,12 @@ interface OpenLot {
     remainingContracts: number;
 }
 
-/** Days from the opening order's execution time to its nearest expiration. */
-function nearDte(openedAt: string, expirations: string[]): number | undefined {
-    if (expirations.length === 0) return undefined;
+/** Days from `fromIso` to an expiration date, floored at 0. */
+function daysAt(fromIso: string, expiration: string): number {
     try {
-        return Math.max(0, differenceInCalendarDays(parseISO(expirations[0]), parseISO(openedAt)));
+        return Math.max(0, differenceInCalendarDays(parseISO(expiration), parseISO(fromIso)));
     } catch {
-        return undefined;
+        return 0;
     }
 }
 
@@ -72,8 +75,7 @@ function pctGain(pnl: number | undefined, openNet: number): number | undefined {
 export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
     const matches: StrategyMatch[] = [];
     for (const order of orderGroups) {
-        const match = classifyOrder(order);
-        if (match) matches.push(match);
+        matches.push(...classifyOrder(order));
     }
 
     // Chronological so FIFO pairing is correct.

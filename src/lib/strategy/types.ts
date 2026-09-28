@@ -92,7 +92,12 @@ export interface StrategyTrade {
     pctGain?: number;
     /** Calendar days held: open->close when closed, open->now when still open. */
     daysOpen?: number;
-    /** Days to expiration of the near leg, measured from openedAt. */
+    /**
+     * Remaining days to the nearest expiration, measured from now (clamped to
+     * 0 once expired). Recomputed fresh on every request — never cached —
+     * since "remaining" only makes sense relative to the current date. See
+     * `applyRemainingDte` in `lib/transactions/service.ts`.
+     */
     dte?: number;
     /** Number of contracts traded per leg (max absolute leg quantity at open). */
     contracts?: number;
@@ -103,6 +108,12 @@ export interface StrategyTrade {
     strikes: number[];
     /** Distinct expirations involved, sorted ascending. */
     expirations: string[];
+    /**
+     * Original days-to-expiration (at open) for each entry in `expirations`,
+     * same order/index. E.g. expirations[i] was `expirationDtes[i]` days out
+     * when the trade was opened.
+     */
+    expirationDtes: number[];
 }
 
 export interface StrategyMetrics {
