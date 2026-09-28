@@ -139,6 +139,17 @@ const LEAPS_MIN_DAYS = 365;
  * expiration), but this rule doesn't chain rolls together — a roll shows up
  * as one FIFO-paired trade closing and a new one opening, same as any other
  * strategy here. See `legSetSignature` / `buildTrades` in pairing.ts.
+ *
+ * Known gap: this >365-day threshold applies to close orders too, using the
+ * *current* remaining days rather than the days-at-open. A LEAPS position
+ * held long enough that its remaining term drops to 365 days or less by the
+ * time it's closed won't match here on the close side. Shape rules have no
+ * memory of what's actually open, so they can't tell "this is a LEAPS
+ * closing" from "this is some other single-leg option closing" — that
+ * requires pairing-time state. `buildTrades` in pairing.ts handles this: when
+ * a single-leg CLOSE order doesn't match any rule, it checks whether the
+ * order's leg signature matches a currently-open LEAPS lot and, if so,
+ * synthesizes a LEAPS close for it.
  */
 export const LEAPS_RULE: StrategyRule = {
     id: 'LEAPS',
