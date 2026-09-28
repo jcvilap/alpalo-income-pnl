@@ -1,3 +1,4 @@
+import { differenceInCalendarDays, parseISO } from 'date-fns';
 import type { RedisClientType } from 'redis';
 import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/accounts';
 import { SchwabClient, type SchwabTransaction } from '@/live/schwabClient';
@@ -8,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v4';
+const STRATEGY_VERSION = 'v9';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -118,6 +119,10 @@ export async function getTrades(opts: {
         // the underlying trade list came from cache or a fresh Schwab fetch.
         await applyUnrealizedPnl(allTrades, account, redis);
 
+        // Remaining DTE depends on "now", not the cached trade's open time, so
+        // it's recomputed fresh on every request regardless of cache status.
+        applyRemainingDte(allTrades);
+
         // Only show trades whose open or close actually falls in the user's
         // requested range — the wider fetch above exists purely to resolve
         // cost basis, not to change what's displayed.
@@ -197,6 +202,27 @@ async function applyUnrealizedPnl(
         trade.pnl = pnl;
         trade.pnlIsEstimate = true;
         trade.pctGain = trade.openNet !== 0 ? (pnl / Math.abs(trade.openNet)) * 100 : undefined;
+    }
+}
+
+/**
+ * Set each trade's `dte` to the remaining calendar days to its nearest
+ * expiration, measured from now and floored at 0. `expirations` is sorted
+ * ascending, so `expirations[0]` is always the near leg.
+ */
+function applyRemainingDte(trades: StrategyTrade[]): void {
+    const now = new Date().toISOString();
+    for (const trade of trades) {
+        const nearExpiration = trade.expirations[0];
+        if (!nearExpiration) {
+            trade.dte = undefined;
+            continue;
+        }
+        try {
+            trade.dte = Math.max(0, differenceInCalendarDays(parseISO(nearExpiration), parseISO(now)));
+        } catch {
+            trade.dte = undefined;
+        }
     }
 }
 

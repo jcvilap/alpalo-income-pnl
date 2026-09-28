@@ -4,11 +4,11 @@ A Vercel-hosted Next.js dashboard that queries **Charles Schwab** transactions,
 identifies which manual option-income strategy each order belongs to, and
 computes P&L metrics (win rate, avg win/loss, best/worst trade, …).
 
-**Current scope: double calendars + double diagonals.** The detection layer
-is rule-based, so jade lizards, iron condors, and strangles can be added
-later by adding a rule — no engine changes. The dashboard's strategy filter
-is a multiselect; selected strategies are pooled into one combined view
-(trades, stat tiles, equity curve all sum across the selection).
+**Current scope: double calendars, double diagonals, strangles, and LEAPS.**
+The detection layer is rule-based, so jade lizards and iron condors can be
+added later by adding a rule — no engine changes. The dashboard's strategy
+filter is a multiselect; selected strategies are pooled into one combined
+view (trades, stat tiles, equity curve all sum across the selection).
 
 ## How it works
 
@@ -35,6 +35,21 @@ Schwab /transactions  →  normalize (group by orderId)  →  classify (strategy
 - **Double diagonal (strict):** same shape as a double calendar, but each
   leg pair's near/far strikes differ — 4 distinct strikes total instead of 2.
   Both rules share `matchDoubleTimeSpread` in `src/lib/strategy/rules.ts`.
+- **Strangle:** one call + one put, same underlying, same expiration,
+  different strikes, opened in a single 2-leg order. **Known limitation:**
+  pairing is whole-order-signature based (see below), so this only detects
+  the *opening* shape and pairs it with a close that also arrives as a single
+  matching 2-leg order. If the two legs are closed independently in separate
+  orders (a common real-world strangle-management pattern — closing one side
+  early), the trade never re-matches the 2-leg shape on close and shows as
+  permanently `open` with an estimated, not realized, P&L. Fixing this
+  requires per-leg pairing state in `pairing.ts` rather than a shape rule —
+  a deliberate scope cut for this pass, not an oversight.
+- **LEAPS:** a single-leg order (one call or put, long or short) with an
+  expiration more than 365 days from the order's execution time. LEAPS
+  positions are sometimes rolled (closed and reopened at a new strike/
+  expiration); this isn't roll-chained — a roll shows up as one trade closing
+  and a new one opening under ordinary FIFO signature pairing.
 - **Lookback widening:** every fetch pulls Schwab's full ~1-year lookback
   ending at `to`, regardless of the user's selected `from` — a trade's
   opening order can sit before the visible window, and without the wider
@@ -117,7 +132,11 @@ Scheduled daily via `vercel.json`.
 5. Bump `STRATEGY_VERSION` in `src/lib/transactions/service.ts` to invalidate
    stale cached trade lists (they won't have the new strategy classified).
 
-Pairing and metrics are strategy-agnostic and need no changes.
+Pairing and metrics are strategy-agnostic and need no changes — *unless* the
+new strategy's legs can close independently across separate orders (like a
+strangle), in which case whole-order signature pairing in `pairing.ts` can't
+represent it and needs a per-leg pairing model instead. See the strangle
+entry above for the specifics of that gap.
 
 ## Layout
 
