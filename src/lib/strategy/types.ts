@@ -50,6 +50,13 @@ export interface Leg {
     pnlIsEstimate?: boolean;
     /** pnl / |openNet| as a percentage. */
     pctGain?: number;
+    /**
+     * True when this leg is currently in-the-money: underlying mark > strike
+     * for a CALL, or underlying mark < strike for a PUT. Only set for open
+     * legs of open trades, once the underlying's live quote is available —
+     * see `applyItmFlags` in transactions/service.ts.
+     */
+    itm?: boolean;
 }
 
 /** All legs that share one Schwab orderId. */

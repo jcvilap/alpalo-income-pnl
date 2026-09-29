@@ -1,7 +1,7 @@
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import type { RedisClientType } from 'redis';
 import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/accounts';
-import { SchwabClient, type SchwabTransaction } from '@/live/schwabClient';
+import { SchwabClient, type SchwabQuote, type SchwabTransaction } from '@/live/schwabClient';
 import { withRedis } from '@/lib/redis';
 import { normalizeToOrderGroups } from '@/lib/strategy/normalize';
 import { buildTrades } from '@/lib/strategy/pairing';
@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v17';
+const STRATEGY_VERSION = 'v18';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -161,11 +161,19 @@ async function applyUnrealizedPnl(
     const openTrades = trades.filter(t => t.status === 'open');
     if (openTrades.length === 0) return;
 
-    const symbols = Array.from(
+    const optionSymbols = Array.from(
         new Set(
             openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.symbol)).filter((s): s is string => !!s),
         ),
     );
+    // Underlyings for every open leg's own symbol (not just option symbols) —
+    // fetched in the same batch so ITM status can be derived alongside
+    // mark-to-market P&L without a second round-trip. Schwab's /quotes
+    // endpoint accepts equity symbols the same as option symbols.
+    const underlyingSymbols = Array.from(
+        new Set(openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.underlying))),
+    );
+    const symbols = Array.from(new Set([...optionSymbols, ...underlyingSymbols]));
     if (symbols.length === 0) return;
 
     const client = new SchwabClient({
@@ -178,7 +186,11 @@ async function applyUnrealizedPnl(
         redis,
     });
 
-    let quotes: Record<string, { mark: number }>;
+    // `SchwabQuote` declares mark/lastPrice as always-present numbers, but in
+    // practice an index underlying's (e.g. SPX) quote payload can omit mark —
+    // Partial<> here reflects that and forces the ITM fallback below to be
+    // null-checked rather than trusting the declared type.
+    let quotes: Record<string, Partial<SchwabQuote>>;
     try {
         quotes = await client.getQuotes(symbols);
     } catch (e) {
@@ -201,6 +213,24 @@ async function applyUnrealizedPnl(
                 if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
                 continue;
             }
+            // ITM only needs the underlying's own price, not the option's
+            // quote — compute it before the option-quote early exit below so
+            // a missing/stale option symbol doesn't also suppress ITM for
+            // this leg (and, since `missingQuote` aborts the whole trade,
+            // every later leg too). Index underlyings (e.g. SPX) often don't
+            // carry `mark` on their quote payload, so fall back to `lastPrice`.
+            const underlyingQuote = quotes[leg.underlying];
+            const underlyingPrice = typeof underlyingQuote?.mark === 'number'
+                ? underlyingQuote.mark
+                : typeof underlyingQuote?.lastPrice === 'number'
+                    ? underlyingQuote.lastPrice
+                    : undefined;
+            if (underlyingPrice != null) {
+                leg.itm = leg.right === 'CALL'
+                    ? underlyingPrice > leg.strike
+                    : underlyingPrice < leg.strike;
+            }
+
             const quote = leg.symbol ? quotes[leg.symbol] : undefined;
             if (!quote || typeof quote.mark !== 'number') {
                 missingQuote = true;
