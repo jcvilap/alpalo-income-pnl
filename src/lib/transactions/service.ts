@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v17';
+const STRATEGY_VERSION = 'v18';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -161,11 +161,19 @@ async function applyUnrealizedPnl(
     const openTrades = trades.filter(t => t.status === 'open');
     if (openTrades.length === 0) return;
 
-    const symbols = Array.from(
+    const optionSymbols = Array.from(
         new Set(
             openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.symbol)).filter((s): s is string => !!s),
         ),
     );
+    // Underlyings for every open leg's own symbol (not just option symbols) —
+    // fetched in the same batch so ITM status can be derived alongside
+    // mark-to-market P&L without a second round-trip. Schwab's /quotes
+    // endpoint accepts equity symbols the same as option symbols.
+    const underlyingSymbols = Array.from(
+        new Set(openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.underlying))),
+    );
+    const symbols = Array.from(new Set([...optionSymbols, ...underlyingSymbols]));
     if (symbols.length === 0) return;
 
     const client = new SchwabClient({
@@ -207,6 +215,16 @@ async function applyUnrealizedPnl(
                 break;
             }
             closeValue += leg.quantity * quote.mark * OPTION_MULTIPLIER;
+
+            // ITM: underlying mark above a CALL's strike, or below a PUT's
+            // strike. Any strategy, not just STRANGLE — the UI shows this
+            // next to each strike in the trades table.
+            const underlyingQuote = quotes[leg.underlying];
+            if (underlyingQuote && typeof underlyingQuote.mark === 'number') {
+                leg.itm = leg.right === 'CALL'
+                    ? underlyingQuote.mark > leg.strike
+                    : underlyingQuote.mark < leg.strike;
+            }
 
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just

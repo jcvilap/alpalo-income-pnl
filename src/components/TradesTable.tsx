@@ -184,7 +184,32 @@ const columns: ColumnDef<StrategyTrade>[] = [
     {
         accessorKey: 'strikes',
         header: 'Strikes',
-        cell: (ctx) => <span className="tabular-nums">{ctx.getValue<number[]>().join(' / ')}</span>,
+        cell: (ctx) => {
+            const strikes = ctx.getValue<number[]>();
+            const legs = ctx.row.original.legs;
+            return (
+                <span className="tabular-nums inline-flex items-center gap-1 flex-wrap justify-end">
+                    {strikes.map((strike, i) => {
+                        const itm = legs.some(l => l.strike === strike && l.itm);
+                        return (
+                            <span key={strike} className="inline-flex items-center gap-1">
+                                {i > 0 && <span>/</span>}
+                                <span>{strike}</span>
+                                {itm && (
+                                    <span
+                                        title="In the money"
+                                        className="text-[10px] font-semibold px-1 rounded"
+                                        style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger-text)' }}
+                                    >
+                                        ITM
+                                    </span>
+                                )}
+                            </span>
+                        );
+                    })}
+                </span>
+            );
+        },
         enableSorting: false,
     },
     {
