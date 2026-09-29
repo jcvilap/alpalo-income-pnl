@@ -132,6 +132,23 @@ describe('buildOrderString', () => {
         assert.match(order, /^BUY/);
     });
 
+    test('BTC (buying to close) gets a positive leg sign, matching the buy transaction', () => {
+        const legs = parseLegs('BTC SPXW 7705C 10/13/26 at 68.20');
+        const order = buildOrderString(legs, computeNetPrice(legs));
+        assert.match(order, /\+1 13 OCT 26 7705 CALL/);
+    });
+
+    test('STC (selling to close) gets a negative leg sign, matching the sell transaction', () => {
+        const legs = parseLegs('STC SPXW 7705C 10/13/26 at 68.20');
+        const order = buildOrderString(legs, computeNetPrice(legs));
+        assert.match(order, /-1 13 OCT 26 7705 CALL/);
+    });
+
+    test('rejects legs spanning more than one underlying', () => {
+        const legs = parseLegs('BTO SPXW 7705C 10/13/26 at 68.20\nSTO NVDA 190C 10/13/26 at 5.00');
+        assert.throws(() => buildOrderString(legs, computeNetPrice(legs)), /underlying/i);
+    });
+
     test('formats fractional strikes without a trailing zero', () => {
         const legs = parseLegs('BTO SPX 4500.5C 10/13/26 at 1.5');
         const order = buildOrderString(legs, computeNetPrice(legs));
@@ -211,7 +228,12 @@ describe('buildOrderString for double calendars/diagonals (real broker examples)
         ].join('\n');
         const legs = parseLegs(input);
         const order = buildOrderString(legs, computeNetPrice(legs), { price: -21.0 });
-        assert.match(order, /^BUY \+2 DBL DIAG/);
+        // price is the *total* across both contracts (ratio 2) — the displayed
+        // per-unit limit price must divide that back out to 10.50, not 21.00.
+        assert.equal(
+            order,
+            'BUY +2 DBL DIAG SPX 100 (Weeklys) 30 NOV 26/30 OCT 26 7660/7710/7660/7710 PUT/CALL/PUT/CALL @10.50 LMT',
+        );
     });
 
     test('falls back to CUSTOM when ratios differ across the 4 legs', () => {
@@ -230,6 +252,18 @@ describe('buildOrderString for double calendars/diagonals (real broker examples)
         const input = [
             line('STO', 'SPXW', 7660, 'P', '10/30/26', 101.9),
             line('STO', 'SPXW', 7600, 'P', '10/30/26', 90),
+            line('BTO', 'SPXW', 7660, 'P', '11/30/26', 144.9),
+            line('BTO', 'SPXW', 7710, 'C', '11/30/26', 178.25),
+        ].join('\n');
+        const legs = parseLegs(input);
+        const order = buildOrderString(legs, computeNetPrice(legs));
+        assert.match(order, /CUSTOM/);
+    });
+
+    test('falls back to CUSTOM when the two legs at one expiration have mixed actions', () => {
+        const input = [
+            line('STO', 'SPXW', 7660, 'P', '10/30/26', 101.9),
+            line('BTO', 'SPXW', 7710, 'C', '10/30/26', 115.9),
             line('BTO', 'SPXW', 7660, 'P', '11/30/26', 144.9),
             line('BTO', 'SPXW', 7710, 'C', '11/30/26', 178.25),
         ].join('\n');
@@ -289,10 +323,12 @@ describe('buildOrderString / convertOrder for strangles (real broker example)', 
         assert.match(order, /^BUY \+1 STRANGLE/);
     });
 
-    test('scales the base quantity with a shared leg ratio', () => {
+    test('scales the base quantity with a shared leg ratio, without doubling the displayed price', () => {
         const legs = parseLegs('STO -2× META 690P 10/30/26 at 24.80\nSTO -2× META 740C 10/30/26 at 29.25');
         const order = buildOrderString(legs, computeNetPrice(legs));
-        assert.match(order, /^SELL -2 STRANGLE/);
+        // computeNetPrice already scaled by ratio 2 (108.10) — the per-contract
+        // limit price must divide that back out to 54.05, not double-count it.
+        assert.equal(order, 'SELL -2 STRANGLE META 100 (Weeklys) 30 OCT 26 740/690 CALL/PUT @54.05 LMT');
     });
 
     test('falls back to CUSTOM when both legs share the same right', () => {
@@ -303,6 +339,12 @@ describe('buildOrderString / convertOrder for strangles (real broker example)', 
 
     test('falls back to CUSTOM when strangle legs have mismatched ratios', () => {
         const legs = parseLegs('STO -1× META 690P 10/30/26 at 24.80\nSTO -2× META 740C 10/30/26 at 29.25');
+        const order = buildOrderString(legs, computeNetPrice(legs));
+        assert.match(order, /CUSTOM/);
+    });
+
+    test('falls back to CUSTOM when the two legs have mixed actions (a risk reversal, not a strangle)', () => {
+        const legs = parseLegs('BTO META 690P 10/30/26 at 24.80\nSTO META 740C 10/30/26 at 29.25');
         const order = buildOrderString(legs, computeNetPrice(legs));
         assert.match(order, /CUSTOM/);
     });
@@ -340,12 +382,14 @@ describe('buildOrderString / convertOrder for iron condors (real broker example)
         assert.match(order, /^BUY \+1 IRON CONDOR/);
     });
 
-    test('scales the base quantity with a shared leg ratio', () => {
+    test('scales the base quantity with a shared leg ratio, without doubling the displayed price', () => {
         const legs = parseLegs(
             'BTO -2× META 715P 10/30/26 at 36.38\nSTO -2× META 720P 10/30/26 at 39.03\nSTO -2× META 790C 10/30/26 at 14.83\nBTO -2× META 880C 10/30/26 at 3.93',
         );
         const order = buildOrderString(legs, computeNetPrice(legs));
-        assert.match(order, /^SELL -2 IRON CONDOR/);
+        // computeNetPrice already scaled by ratio 2 (27.10) — the per-contract
+        // limit price must divide that back out to 13.55, not double-count it.
+        assert.equal(order, 'SELL -2 IRON CONDOR META 100 (Weeklys) 30 OCT 26 790/880/720/715 CALL/PUT @13.55 LMT');
     });
 
     test('falls back to CUSTOM when a right has two short (or two long) legs instead of one of each', () => {

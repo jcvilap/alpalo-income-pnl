@@ -11,9 +11,9 @@ function toTosDate(expiration: string): string {
     return `${day} ${MONTHS[month - 1]} ${year.toString().padStart(2, '0')}`;
 }
 
-/** Signed ratio for a leg relative to the order's base quantity: BTO/STC are long (+), STO/BTC are short (-). */
+/** Signed ratio for a leg relative to the order's base quantity: BTO/BTC (buying) are + , STO/STC (selling) are -. */
 function signedRatio(leg: ParsedLeg): number {
-    const sign = leg.action === 'BTO' || leg.action === 'STC' ? 1 : -1;
+    const sign = leg.action === 'BTO' || leg.action === 'BTC' ? 1 : -1;
     return sign * leg.ratio;
 }
 
@@ -39,6 +39,22 @@ export interface BuildOrderOptions {
 }
 
 /**
+ * Named-strategy order strings quote the price per base-quantity unit (e.g.
+ * one strangle), while the order's quantity separately conveys the ratio.
+ * `price` here is the total net price across all legs at their actual
+ * ratio (computeNetPrice's convention), so divide out the shared ratio
+ * before display or the limit price double-counts it.
+ */
+function perUnitPrice(price: number, ratio: number): number {
+    return price / ratio;
+}
+
+/** All legs share the same action (e.g. all STO, or all BTC) — required for a strangle/calendar leg group to represent one coherent strategy rather than a mixed combo. */
+function sameAction(legs: ParsedLeg[]): boolean {
+    return legs.every((l) => l.action === legs[0].action);
+}
+
+/**
  * A double calendar/diagonal: exactly 2 distinct expirations, exactly one PUT
  * and one CALL leg per expiration (4 legs total), same ratio throughout.
  * Matches TOS's "DBL DIAG" order-bar grammar regardless of whether strikes
@@ -56,6 +72,10 @@ function isDoubleCalendarOrDiagonal(legs: ParsedLeg[]): boolean {
         if (legsAtExp.length !== 2) return false;
         const rights = new Set(legsAtExp.map((l) => l.right));
         if (rights.size !== 2) return false;
+        // Both legs at one expiration must move together (e.g. both STO the
+        // front month, both BTO the back month) — a real calendar/diagonal,
+        // not a mixed combo that happens to match the leg-shape.
+        if (!sameAction(legsAtExp)) return false;
     }
     return true;
 }
@@ -77,11 +97,12 @@ function buildDoubleDiagonalString(legs: ParsedLeg[], price: number): string {
     }
 
     const ratio = legs[0].ratio;
-    const verb = price >= 0 ? 'SELL' : 'BUY';
+    const unitPrice = perUnitPrice(price, ratio);
+    const verb = unitPrice >= 0 ? 'SELL' : 'BUY';
     const qty = verb === 'BUY' ? `+${ratio}` : `-${ratio}`;
     const dateClause = expirations.map(toTosDate).join('/');
 
-    return `${verb} ${qty} DBL DIAG ${underlying} 100 (Weeklys) ${dateClause} ${strikes.join('/')} ${rights.join('/')} @${Math.abs(price).toFixed(2)} LMT`;
+    return `${verb} ${qty} DBL DIAG ${underlying} 100 (Weeklys) ${dateClause} ${strikes.join('/')} ${rights.join('/')} @${Math.abs(unitPrice).toFixed(2)} LMT`;
 }
 
 /**
@@ -93,6 +114,7 @@ function isStrangle(legs: ParsedLeg[]): boolean {
     if (legs.length !== 2) return false;
     if (legs[0].expiration !== legs[1].expiration) return false;
     if (legs[0].ratio !== legs[1].ratio) return false;
+    if (!sameAction(legs)) return false;
     const rights = new Set(legs.map((l) => l.right));
     return rights.size === 2;
 }
@@ -104,10 +126,11 @@ function buildStrangleString(legs: ParsedLeg[], price: number): string {
     const put = legs.find((l) => l.right === 'PUT')!;
 
     const ratio = legs[0].ratio;
-    const verb = price >= 0 ? 'SELL' : 'BUY';
+    const unitPrice = perUnitPrice(price, ratio);
+    const verb = unitPrice >= 0 ? 'SELL' : 'BUY';
     const qty = verb === 'BUY' ? `+${ratio}` : `-${ratio}`;
 
-    return `${verb} ${qty} STRANGLE ${underlying} 100 (Weeklys) ${toTosDate(call.expiration)} ${formatStrike(call.strike)}/${formatStrike(put.strike)} CALL/PUT @${Math.abs(price).toFixed(2)} LMT`;
+    return `${verb} ${qty} STRANGLE ${underlying} 100 (Weeklys) ${toTosDate(call.expiration)} ${formatStrike(call.strike)}/${formatStrike(put.strike)} CALL/PUT @${Math.abs(unitPrice).toFixed(2)} LMT`;
 }
 
 /** Whether a leg opens/holds a short position (STO) vs. long (BTO). */
@@ -151,10 +174,11 @@ function buildIronCondorString(legs: ParsedLeg[], price: number): string {
     }
 
     const ratio = legs[0].ratio;
-    const verb = price >= 0 ? 'SELL' : 'BUY';
+    const unitPrice = perUnitPrice(price, ratio);
+    const verb = unitPrice >= 0 ? 'SELL' : 'BUY';
     const qty = verb === 'BUY' ? `+${ratio}` : `-${ratio}`;
 
-    return `${verb} ${qty} IRON CONDOR ${underlying} 100 (Weeklys) ${toTosDate(expiration)} ${strikes.join('/')} CALL/PUT @${Math.abs(price).toFixed(2)} LMT`;
+    return `${verb} ${qty} IRON CONDOR ${underlying} 100 (Weeklys) ${toTosDate(expiration)} ${strikes.join('/')} CALL/PUT @${Math.abs(unitPrice).toFixed(2)} LMT`;
 }
 
 /**
@@ -184,6 +208,9 @@ function buildCustomString(legs: ParsedLeg[], price: number): string {
 export function buildOrderString(legs: ParsedLeg[], netPrice: number, options: BuildOrderOptions = {}): string {
     if (legs.length === 0) {
         throw new Error('Cannot build an order string with no legs.');
+    }
+    if (new Set(legs.map((l) => l.underlying)).size > 1) {
+        throw new Error('All legs must share the same underlying to build a single combo order.');
     }
 
     const price = options.price ?? netPrice;
