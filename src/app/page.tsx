@@ -79,7 +79,11 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
 }
 
 const VALID_PRESET_IDS = new Set<string>(RANGE_PRESETS.map((p) => p.id));
-const VALID_STRATEGY_IDS = new Set(STRATEGIES.map((s) => s.id));
+// Only enabled strategies are deep-link-selectable — a disabled one (e.g.
+// jade_lizard) can't be unchecked in the UI and isn't accepted by the API
+// either (which silently falls back to DOUBLE_CALENDAR), so allowing it here
+// would strand the dashboard showing mismatched data with no way to fix it.
+const VALID_STRATEGY_IDS = new Set(STRATEGIES.filter((s) => s.enabled).map((s) => s.id));
 
 function readInitialState(searchParams: URLSearchParams) {
     const presetParam = searchParams.get('preset');

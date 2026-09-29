@@ -15,7 +15,11 @@ import type { StrategyId, StrategyMetrics, StrategyTrade } from './types';
  * opts in.
  */
 export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[], includeUnrealized = false): StrategyMetrics {
-    const closed = trades.filter(t => t.status === 'closed' && typeof t.pnl === 'number');
+    // `excludeFromMetrics` marks a standalone closed-leg record (see
+    // `closeStrangleLeg` in pairing.ts) whose realized P&L has already been
+    // folded into a still-open sibling trade's own `pnl` — counting both
+    // here would double-count the same realized result.
+    const closed = trades.filter(t => t.status === 'closed' && typeof t.pnl === 'number' && !t.excludeFromMetrics);
     const openWithPnl = includeUnrealized
         ? trades.filter(t => t.status === 'open' && typeof t.pnl === 'number')
         : [];
@@ -75,7 +79,7 @@ export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[]
  */
 export function cumulativePnlSeries(trades: StrategyTrade[]): { date: string; pnl: number; cumulative: number }[] {
     const closed = trades
-        .filter(t => t.status === 'closed' && typeof t.pnl === 'number' && t.closedAt)
+        .filter(t => t.status === 'closed' && typeof t.pnl === 'number' && t.closedAt && !t.excludeFromMetrics)
         .sort((a, b) => (a.closedAt as string).localeCompare(b.closedAt as string));
 
     let cumulative = 0;

@@ -97,6 +97,21 @@ interface OpenLot {
     closedLegs?: Leg[];
 }
 
+/**
+ * This leg's gross fill cash as a fraction of the total gross fill cash
+ * across all of `orderLegs` (the whole opening order it belongs to). Used to
+ * allocate a shared order-level `netAmount` — which includes commissions/fees
+ * on top of gross fill cash — proportionally to one leg, so the fee doesn't
+ * simply vanish when that leg is later tracked/closed independently of its
+ * sibling. Falls back to an even split if gross cash nets to zero (e.g. a
+ * curiously priced spread) to avoid a divide-by-zero.
+ */
+function legWeight(leg: Leg, orderLegs: Leg[]): number {
+    const totalGross = orderLegs.reduce((s, l) => s + Math.abs(legNetAmount(l)), 0);
+    if (totalGross === 0) return orderLegs.length > 0 ? 1 / orderLegs.length : 1;
+    return Math.abs(legNetAmount(leg)) / totalGross;
+}
+
 /** Days from `fromIso` to an expiration date, floored at 0. */
 function daysAt(fromIso: string, expiration: string): number {
     try {
@@ -171,6 +186,11 @@ function closeStrangleLeg(
     // close finishes off the lot's last remaining leg and the lot itself is
     // about to be discarded.
     let siblingLegs: Leg[] = [];
+    // True once any lot this close touches still has an open leg remaining
+    // afterward — that lot's realized P&L will resurface via `realizedLegPnl`
+    // on its still-open sibling trade (see `applyUnrealizedPnl`), so this
+    // standalone record must not also count in aggregate metrics.
+    let hasOpenSibling = false;
 
     for (const q of openQueues.values()) {
         for (let i = 0; i < q.length && remainingToClose > 0; ) {
@@ -186,8 +206,15 @@ function closeStrangleLeg(
             const consumed = Math.min(legQtyAvailable, remainingToClose);
             if (consumed <= 0) { i++; continue; }
 
-            const fraction = consumed / Math.abs(leg.quantity);
-            const legOpenShare = fraction * legNetAmount(leg);
+            // Allocate this leg's share of the lot's *actual* opening netAmount
+            // (which includes commissions/fees) rather than reconstructing
+            // gross fill cash via legNetAmount alone — otherwise the fee
+            // residual is silently dropped once the lot's last leg closes and
+            // the lot is discarded, understating the true cost basis.
+            // Weight = this leg's gross cash as a fraction of the whole
+            // opening order's total gross cash across both legs.
+            const grossWeight = legWeight(leg, lot.match.order.legs);
+            const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
             openShareTotal += legOpenShare;
             if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
             if (!firstLot) firstLot = lot;
@@ -231,6 +258,7 @@ function closeStrangleLeg(
                 q.splice(i, 1);
                 continue;
             }
+            hasOpenSibling = true;
             i++;
         }
     }
@@ -250,13 +278,14 @@ function closeStrangleLeg(
     const strikes = distinctSorted(allLegs.map(l => l.strike));
     const expirations = distinctSorted(allLegs.map(l => l.expiration));
 
+    const openedAt = earliestOpenTime ?? order.time;
     return {
         id: `strangle-leg-close-${order.orderId}-${closingLeg.strike}-${closingLeg.right}`,
         strategy: 'STRANGLE',
         underlying: order.underlying,
         status: 'closed',
         openOrderId: firstLot.match.order.orderId,
-        openedAt: earliestOpenTime ?? order.time,
+        openedAt,
         openNet: openShareTotal,
         closeOrderId: order.orderId,
         closedAt: order.time,
@@ -264,10 +293,13 @@ function closeStrangleLeg(
         pnl,
         pctGain: pctGain(pnl, openShareTotal),
         daysOpen,
+        excludeFromMetrics: hasOpenSibling,
         legs: allLegs,
         strikes,
         expirations,
-        expirationDtes: expirations.map(e => daysAt(order.time, e)),
+        // DTE-at-open, not at this close — same contract as every other
+        // trade's `expirationDtes` (see StrategyTrade.expirationDtes).
+        expirationDtes: expirations.map(e => daysAt(openedAt, e)),
         contracts: consumedContracts,
     };
 }
@@ -396,6 +428,12 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
 
                 lot.remainingContracts -= consumed;
                 remainingToClose -= consumed;
+                // Keep the lot's remaining cost basis in sync with the contracts
+                // actually left — otherwise a partially-closed multi-contract
+                // strangle lot would still report its *original* full-size
+                // openNet for its now-smaller remaining position (see
+                // `OpenLot.remainingOpenNet`).
+                if (lot.remainingOpenNet != null) lot.remainingOpenNet -= openShare;
                 if (lot.remainingContracts === 0) q.shift();
             }
 
