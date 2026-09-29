@@ -1,7 +1,7 @@
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import type { RedisClientType } from 'redis';
 import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/accounts';
-import { SchwabClient, type SchwabTransaction } from '@/live/schwabClient';
+import { SchwabClient, type SchwabQuote, type SchwabTransaction } from '@/live/schwabClient';
 import { withRedis } from '@/lib/redis';
 import { normalizeToOrderGroups } from '@/lib/strategy/normalize';
 import { buildTrades } from '@/lib/strategy/pairing';
@@ -186,7 +186,11 @@ async function applyUnrealizedPnl(
         redis,
     });
 
-    let quotes: Record<string, { mark: number }>;
+    // `SchwabQuote` declares mark/lastPrice as always-present numbers, but in
+    // practice an index underlying's (e.g. SPX) quote payload can omit mark —
+    // Partial<> here reflects that and forces the ITM fallback below to be
+    // null-checked rather than trusting the declared type.
+    let quotes: Record<string, Partial<SchwabQuote>>;
     try {
         quotes = await client.getQuotes(symbols);
     } catch (e) {
@@ -209,22 +213,30 @@ async function applyUnrealizedPnl(
                 if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
                 continue;
             }
+            // ITM only needs the underlying's own price, not the option's
+            // quote — compute it before the option-quote early exit below so
+            // a missing/stale option symbol doesn't also suppress ITM for
+            // this leg (and, since `missingQuote` aborts the whole trade,
+            // every later leg too). Index underlyings (e.g. SPX) often don't
+            // carry `mark` on their quote payload, so fall back to `lastPrice`.
+            const underlyingQuote = quotes[leg.underlying];
+            const underlyingPrice = typeof underlyingQuote?.mark === 'number'
+                ? underlyingQuote.mark
+                : typeof underlyingQuote?.lastPrice === 'number'
+                    ? underlyingQuote.lastPrice
+                    : undefined;
+            if (underlyingPrice != null) {
+                leg.itm = leg.right === 'CALL'
+                    ? underlyingPrice > leg.strike
+                    : underlyingPrice < leg.strike;
+            }
+
             const quote = leg.symbol ? quotes[leg.symbol] : undefined;
             if (!quote || typeof quote.mark !== 'number') {
                 missingQuote = true;
                 break;
             }
             closeValue += leg.quantity * quote.mark * OPTION_MULTIPLIER;
-
-            // ITM: underlying mark above a CALL's strike, or below a PUT's
-            // strike. Any strategy, not just STRANGLE — the UI shows this
-            // next to each strike in the trades table.
-            const underlyingQuote = quotes[leg.underlying];
-            if (underlyingQuote && typeof underlyingQuote.mark === 'number') {
-                leg.itm = leg.right === 'CALL'
-                    ? underlyingQuote.mark > leg.strike
-                    : underlyingQuote.mark < leg.strike;
-            }
 
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just
