@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v18';
+const STRATEGY_VERSION = 'v21';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -56,11 +56,19 @@ function clampLookback(to: string): string {
     return earliestAllowed.toISOString();
 }
 
-/** True when a trade's open or close falls anywhere inside [from, to]. */
+/**
+ * True when a trade's open or close falls anywhere inside [from, to].
+ * Checks every fill that contributed to the open side (`openFillTimes`), not
+ * just the earliest (`openedAt`) — a position first opened before the
+ * requested range but increased again inside it (see `mergeIntoOpenLot` in
+ * pairing.ts) must still show up, since that later fill is genuinely
+ * in-range activity even though the position's overall display open date
+ * isn't.
+ */
 function tradeInRange(trade: StrategyTrade, from: string, to: string): boolean {
-    const opened = trade.openedAt;
+    const openTimes = trade.openFillTimes && trade.openFillTimes.length > 0 ? trade.openFillTimes : [trade.openedAt];
     const closed = trade.closedAt ?? trade.openedAt;
-    return (opened >= from && opened <= to) || (closed >= from && closed <= to);
+    return openTimes.some(opened => opened >= from && opened <= to) || (closed >= from && closed <= to);
 }
 
 /**
