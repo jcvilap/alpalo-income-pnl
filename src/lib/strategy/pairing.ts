@@ -94,9 +94,24 @@ function blendLeg(a: Leg, b: Leg): Leg {
  * pools contracts/netAmount, volume-weights each leg's price, and keeps the
  * *earliest* time as the position's display open date (a broker shows when
  * the position was first opened, not when it was last added to).
+ *
+ * If the lot has already been partially closed, `base` is first rebased down
+ * to just its *remaining* contracts/cost basis before blending in the new
+ * order — otherwise the already-realized contracts' opening cash would stay
+ * mixed into `totalContracts`/`netAmount`, and every later
+ * `(consumed / totalContracts) * netAmount` allocation (open share, close
+ * share, per-leg P&L) would silently redistribute stale, already-realized
+ * cost basis onto the new contracts.
  */
 function mergeIntoOpenLot(lot: OpenLot, incoming: StrategyMatch, incomingContracts: number): void {
-    const base = lot.match.order;
+    const remainingRatio = lot.remainingContracts / lot.totalContracts;
+    const base: OrderGroup = remainingRatio === 1
+        ? lot.match.order
+        : {
+              ...lot.match.order,
+              legs: lot.match.order.legs.map(l => ({ ...l, quantity: Math.sign(l.quantity) * Math.round(Math.abs(l.quantity) * remainingRatio) })),
+              netAmount: lot.match.order.netAmount * remainingRatio,
+          };
     const add = incoming.order;
 
     const mergedLegs = base.legs.map(baseLeg => {
@@ -113,17 +128,44 @@ function mergeIntoOpenLot(lot: OpenLot, incoming: StrategyMatch, incomingContrac
             time: base.time < add.time ? base.time : add.time,
         },
     };
-    lot.totalContracts += incomingContracts;
+    lot.totalContracts = lot.remainingContracts + incomingContracts;
     lot.remainingContracts += incomingContracts;
     if (lot.openLegs) {
-        lot.openLegs = lot.openLegs.map(openLeg => {
+        // Rebase each open leg's own cost basis the same way, then blend.
+        const openLegsRebased = remainingRatio === 1
+            ? lot.openLegs
+            : lot.openLegs.map(l => ({
+                  ...l,
+                  quantity: Math.sign(l.quantity) * Math.round(Math.abs(l.quantity) * remainingRatio),
+                  openNet: l.openNet != null ? l.openNet * remainingRatio : l.openNet,
+              }));
+        const matchedAddLegs = new Set<Leg>();
+        const blended = openLegsRebased.map(openLeg => {
             const addLeg = add.legs.find(l => l.right === openLeg.right && l.strike === openLeg.strike && l.expiration === openLeg.expiration);
             if (!addLeg) return openLeg;
-            const blended = blendLeg(openLeg, addLeg);
-            return { ...blended, openNet: legNetAmount(blended) };
+            matchedAddLegs.add(addLeg);
+            const merged = blendLeg(openLeg, addLeg);
+            return { ...merged, openNet: legNetAmount(merged) };
         });
+        // A leg the incoming order carries but `openLegs` no longer has (its
+        // sibling was closed independently earlier, splicing it out of
+        // openLegs — see `closeStrangleLeg`) isn't a blend target; it's a
+        // brand-new open leg and must still be added, or its cost basis would
+        // be silently invisible from `legs`/quotes/mark-to-market even though
+        // `netAmount`/`remainingOpenNet` below already include its cash.
+        const reintroducedLegs = add.legs
+            .filter(l => !matchedAddLegs.has(l))
+            .map(l => ({ ...l, openNet: legNetAmount(l) }));
+        lot.openLegs = [...blended, ...reintroducedLegs];
     }
+    // `remainingOpenNet` is already the true remaining basis — it's decremented
+    // incrementally as legs close (see `closeStrangleLeg` / the whole-order
+    // CLOSE branch below), unlike `base.netAmount` above which is a fresh
+    // proportional derivation from `totalContracts` each time. It must NOT be
+    // rebased by `remainingRatio` again here — only the new order's cash gets
+    // added on top.
     if (lot.remainingOpenNet != null) lot.remainingOpenNet += add.netAmount;
+    lot.openFillTimes = [...lot.openFillTimes, add.time];
 }
 
 /** A queued open with contracts consumed so far by prior partial closes. */
@@ -155,6 +197,14 @@ interface OpenLot {
      * detail row shows every original leg, not just what's still live.
      */
     closedLegs?: Leg[];
+    /**
+     * Every distinct order time that has contributed to this lot's open
+     * side — starts as `[match.order.time]` and gains one entry per merge
+     * (see `mergeIntoOpenLot`). Propagated onto the resulting trade's
+     * `openFillTimes` so range filtering can see a fresh addition to an old
+     * position even though `openedAt` display always shows the earliest.
+     */
+    openFillTimes: string[];
 }
 
 /**
@@ -464,6 +514,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                         ? match.order.legs.map(l => ({ ...l, openNet: legNetAmount(l) }))
                         : undefined,
                     remainingOpenNet: match.strategy === 'STRANGLE' ? match.order.netAmount : undefined,
+                    openFillTimes: [match.order.time],
                 });
                 openQueues.set(match.signature, q);
                 continue;
@@ -480,8 +531,17 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 const openShare = (consumed / lot.totalContracts) * lot.match.order.netAmount;
                 const closeShare = (consumed / totalCloseContracts) * match.order.netAmount;
 
-                const liveLegs = lot.match.strategy === 'STRANGLE' && lot.openLegs
-                    ? stampStrangleLegCloses(lot.openLegs, match.order.legs, lot.match.order.underlying)
+                // Scale each open leg's own cost basis down to just the
+                // consumed slice before computing its realized close — a
+                // merged multi-contract lot's `openLegs[i].openNet` reflects
+                // the *whole* lot, but this close may only consume part of it
+                // (see `mergeIntoOpenLot`), so per-leg P&L must be derived
+                // from the consumed share, not the lot's full aggregate.
+                const consumedOpenLegs = lot.openLegs && consumed !== lot.totalContracts
+                    ? scaleLegs(lot.openLegs, lot.totalContracts, consumed)
+                    : lot.openLegs;
+                const liveLegs = lot.match.strategy === 'STRANGLE' && consumedOpenLegs
+                    ? stampStrangleLegCloses(consumedOpenLegs, match.order.legs, lot.match.order.underlying)
                     : lot.openLegs;
                 const shape = toTradeShape(lot.match, consumed, liveLegs, lot.closedLegs);
                 const pnl = openShare + closeShare;
@@ -493,6 +553,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                     status: 'closed',
                     openOrderId: lot.match.order.orderId,
                     openedAt: lot.match.order.time,
+                    openFillTimes: lot.openFillTimes,
                     openNet: openShare,
                     closeOrderId: match.order.orderId,
                     closedAt: match.order.time,
@@ -551,6 +612,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 status: 'open',
                 openOrderId: lot.match.order.orderId,
                 openedAt: lot.match.order.time,
+                openFillTimes: lot.openFillTimes,
                 openNet: openShare,
                 daysOpen: safeHoldDays(lot.match.order.time, new Date().toISOString()),
                 ...shape,

@@ -97,6 +97,17 @@ export interface StrategyTrade {
     openedAt: string;
     /** Net cash of the opening order (negative = debit paid to open). */
     openNet: number;
+    /**
+     * Every distinct fill time that contributed to this position's open side
+     * — usually just `[openedAt]`, but a position increased on a later day
+     * (see `mergeIntoOpenLot` in pairing.ts) has one entry per merged order.
+     * `openedAt` stays the *earliest* of these for display, but range
+     * filtering (`tradeInRange` in transactions/service.ts) checks every
+     * entry here so a fresh in-range addition to an old position doesn't
+     * disappear just because the position's original open predates the
+     * requested range.
+     */
+    openFillTimes?: string[];
 
     closeOrderId?: string;
     closedAt?: string;
