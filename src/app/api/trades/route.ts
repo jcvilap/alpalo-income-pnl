@@ -4,7 +4,7 @@ import type { StrategyId } from '@/lib/strategy/types';
 
 export const dynamic = 'force-dynamic';
 
-const SUPPORTED_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR', 'DOUBLE_DIAGONAL', 'STRANGLE', 'LEAPS'];
+const SUPPORTED_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR', 'DOUBLE_DIAGONAL', 'STRANGLE', 'LEAPS', 'IRON_CONDOR'];
 
 /** Parse a comma-separated strategy query param (case-insensitive, dashes/underscores). */
 function parseStrategies(raw: string | null): StrategyId[] {

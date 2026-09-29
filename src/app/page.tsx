@@ -31,7 +31,7 @@ const STRATEGIES = [
     { id: 'double_calendar', label: 'Double Calendar', enabled: true },
     { id: 'double_diagonal', label: 'Double Diagonal', enabled: true },
     { id: 'jade_lizard', label: 'Jade Lizard', enabled: false },
-    { id: 'iron_condor', label: 'Iron Condor', enabled: false },
+    { id: 'iron_condor', label: 'Iron Condor', enabled: true },
     { id: 'strangle', label: 'Strangle', enabled: true },
     { id: 'leaps', label: 'LEAPS', enabled: true },
 ];

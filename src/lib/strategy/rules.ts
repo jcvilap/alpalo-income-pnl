@@ -203,10 +203,62 @@ export const STRANGLE_RULE: StrategyRule = {
     },
 };
 
+/**
+ * Iron Condor: a call spread + a put spread, same underlying, same
+ * expiration, opened/closed in a single 4-leg order, with strikes in the
+ * classic condor order — put wing < put body < call body < call wing — so
+ * the two inner ("body") strikes sit between the two outer ("wing") strikes
+ * and every strike is distinct. A same-strikes-on-both-sides shape (iron
+ * butterfly) or any other 4-leg combination doesn't match.
+ *
+ * Strike position (inner vs outer), not quantity sign, decides which leg is
+ * the body vs the wing — sign only confirms one long + one short per side.
+ * This is what makes the rule symmetric between opening (short body / long
+ * wings) and closing (buy back the body / sell the wings) the same shape:
+ * on a close, the wing is bought back and the body sold, so "short" no
+ * longer identifies the wing the way it does on open — see AGENTS.md's
+ * open/close symmetry note for why shape rules must never depend on sign to
+ * distinguish structural roles that flip between open and close.
+ */
+export const IRON_CONDOR_RULE: StrategyRule = {
+    id: 'IRON_CONDOR',
+    name: 'Iron Condor',
+    matches(order: OrderGroup): boolean {
+        const legs = order.legs;
+        if (legs.length !== 4) return false;
+
+        const calls = legs.filter(l => l.right === 'CALL');
+        const puts = legs.filter(l => l.right === 'PUT');
+        if (calls.length !== 2 || puts.length !== 2) return false;
+
+        const expirations = new Set(legs.map(l => l.expiration));
+        if (expirations.size !== 1) return false;
+
+        const [callA, callB] = calls;
+        const [putA, putB] = puts;
+        // One short + one long on each side (opposite signs), never flat —
+        // holds on both open and close since a spread's two legs always trade
+        // in opposite directions regardless of which side is "short" today.
+        if (Math.sign(callA.quantity) === Math.sign(callB.quantity)) return false;
+        if (Math.sign(putA.quantity) === Math.sign(putB.quantity)) return false;
+        if (callA.quantity === 0 || callB.quantity === 0 || putA.quantity === 0 || putB.quantity === 0) return false;
+
+        const callBody = Math.min(callA.strike, callB.strike);
+        const callWing = Math.max(callA.strike, callB.strike);
+        const putBody = Math.max(putA.strike, putB.strike);
+        const putWing = Math.min(putA.strike, putB.strike);
+        if (callBody === callWing || putBody === putWing) return false;
+
+        // Classic condor strike order: put wing < put body < call body < call wing.
+        return putWing < putBody && putBody < callBody && callBody < callWing;
+    },
+};
+
 /** Registry of active strategy rules. Order = detection priority. */
 export const STRATEGY_RULES: StrategyRule[] = [
     DOUBLE_CALENDAR_RULE,
     DOUBLE_DIAGONAL_RULE,
+    IRON_CONDOR_RULE,
     STRANGLE_RULE,
     LEAPS_RULE,
 ];
