@@ -66,6 +66,66 @@ function matchContracts(match: StrategyMatch): number | undefined {
     return legs.length > 0 ? Math.max(...legs.map(l => Math.abs(l.quantity))) : undefined;
 }
 
+/**
+ * Combine two OPEN legs of the same right/strike/expiration into one,
+ * volume-weighting the price and summing quantity — same blending a broker's
+ * position view uses when the same contract is bought/sold across multiple
+ * fills. Assumes both legs share sign (both opening the same direction),
+ * which always holds here since both come from OPEN orders on the same
+ * strategy signature.
+ */
+function blendLeg(a: Leg, b: Leg): Leg {
+    const absA = Math.abs(a.quantity);
+    const absB = Math.abs(b.quantity);
+    const denom = absA + absB;
+    return {
+        ...a,
+        quantity: a.quantity + b.quantity,
+        price: denom > 0 ? (a.price * absA + b.price * absB) / denom : a.price,
+    };
+}
+
+/**
+ * Merge a newly-opened order into an existing open lot of the *same
+ * signature* (same underlying/strategy shape — right/strike/expiration) —
+ * e.g. adding 1 more contract to an already-open strangle on a later day.
+ * Mirrors how a broker's position view shows one row per contract shape with
+ * a blended average price, not one row per fill. Mutates `lot` in place:
+ * pools contracts/netAmount, volume-weights each leg's price, and keeps the
+ * *earliest* time as the position's display open date (a broker shows when
+ * the position was first opened, not when it was last added to).
+ */
+function mergeIntoOpenLot(lot: OpenLot, incoming: StrategyMatch, incomingContracts: number): void {
+    const base = lot.match.order;
+    const add = incoming.order;
+
+    const mergedLegs = base.legs.map(baseLeg => {
+        const addLeg = add.legs.find(l => l.right === baseLeg.right && l.strike === baseLeg.strike && l.expiration === baseLeg.expiration);
+        return addLeg ? blendLeg(baseLeg, addLeg) : baseLeg;
+    });
+
+    lot.match = {
+        ...lot.match,
+        order: {
+            ...base,
+            legs: mergedLegs,
+            netAmount: base.netAmount + add.netAmount,
+            time: base.time < add.time ? base.time : add.time,
+        },
+    };
+    lot.totalContracts += incomingContracts;
+    lot.remainingContracts += incomingContracts;
+    if (lot.openLegs) {
+        lot.openLegs = lot.openLegs.map(openLeg => {
+            const addLeg = add.legs.find(l => l.right === openLeg.right && l.strike === openLeg.strike && l.expiration === openLeg.expiration);
+            if (!addLeg) return openLeg;
+            const blended = blendLeg(openLeg, addLeg);
+            return { ...blended, openNet: legNetAmount(blended) };
+        });
+    }
+    if (lot.remainingOpenNet != null) lot.remainingOpenNet += add.netAmount;
+}
+
 /** A queued open with contracts consumed so far by prior partial closes. */
 interface OpenLot {
     match: StrategyMatch;
@@ -379,6 +439,23 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
             if (match.side === 'OPEN') {
                 const contracts = matchContracts(match) ?? 1;
                 const q = openQueues.get(match.signature) ?? [];
+
+                // Same underlying/strategy shape already open (from an
+                // earlier order, possibly a different day) — merge into it
+                // rather than tracking a second parallel lot, so the trade
+                // list shows one position with a blended average price, the
+                // same way a broker's position view does. Only the most
+                // recent lot for this signature is checked: once merged,
+                // there's only ever one lot per signature going forward
+                // (barring a signature that closed fully and later reopened,
+                // which starts a fresh lot after the prior one is shifted out
+                // of the queue on close).
+                const existingLot = q.length > 0 ? q[q.length - 1] : undefined;
+                if (existingLot) {
+                    mergeIntoOpenLot(existingLot, match, contracts);
+                    continue;
+                }
+
                 q.push({
                     match,
                     totalContracts: contracts,
