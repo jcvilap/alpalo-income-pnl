@@ -239,8 +239,13 @@ export function legSetSignature(order: OrderGroup): string {
 }
 
 /** A fill's cash impact per Schwab's convention (see AGENTS.md): -quantity * price * 100. */
-function legNetAmount(leg: Leg): number {
+export function legNetAmount(leg: Leg): number {
     return -leg.quantity * leg.price * 100;
+}
+
+/** Signature of a single leg (underlying + right/strike/expiration), used to match a lone leg against one leg of an open multi-leg lot. */
+export function legSignature(underlying: string, leg: Pick<Leg, 'right' | 'strike' | 'expiration'>): string {
+    return `${underlying}|${leg.right}:${leg.strike}:${leg.expiration}`;
 }
 
 /**

@@ -35,6 +35,21 @@ export interface Leg {
     price: number;
     /** OCC option symbol as reported by Schwab. */
     symbol?: string;
+    /**
+     * This leg's own share of entry cash (-quantity * price * 100). Populated
+     * for STRANGLE legs only, so the UI's per-leg detail row can show each
+     * leg's own open/close/P&L figures — see `legNetAmount` in rules.ts and
+     * the detail-row synthesis in `TradesTable.tsx`.
+     */
+    openNet?: number;
+    /** This leg's own live mark-to-market close value, once quoted. STRANGLE legs only. */
+    closeNet?: number;
+    /** This leg's own P&L: realized (closeNet != null) or live estimate. STRANGLE legs only. */
+    pnl?: number;
+    /** True when `pnl` is a live mark-to-market estimate rather than realized cash. */
+    pnlIsEstimate?: boolean;
+    /** pnl / |openNet| as a percentage. */
+    pctGain?: number;
 }
 
 /** All legs that share one Schwab orderId. */
@@ -88,6 +103,16 @@ export interface StrategyTrade {
     pnl?: number;
     /** True when `pnl` is a live estimate (open trade) rather than realized cash. */
     pnlIsEstimate?: boolean;
+    /**
+     * True for a standalone closed-leg record (see `closeStrangleLeg` in
+     * pairing.ts) whose sibling leg is still open — that leg's realized `pnl`
+     * is also folded into the still-open sibling trade's own `pnl` (see
+     * `realizedLegPnl` in `applyUnrealizedPnl`), so this record must be
+     * excluded from aggregate metrics to avoid double-counting the same
+     * realized result. The row still displays normally in the trades table —
+     * only `computeMetrics` needs to skip it.
+     */
+    excludeFromMetrics?: boolean;
     /** pnl / |openNet| as a percentage, e.g. debit 10 -> credit 11.5 is +15. */
     pctGain?: number;
     /** Calendar days held: open->close when closed, open->now when still open. */

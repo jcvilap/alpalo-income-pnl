@@ -4,6 +4,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Lock } from 'lucide-react';
 
 const SESSION_KEY = 'alpalo-income-pnl:authed';
+const PASSWORD_KEY = 'alpalo-income-pnl:password';
 const USERNAME = 'admin';
 const PASSWORD = '123';
 
@@ -21,12 +22,15 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
 
     useEffect(() => {
         setAuthed(sessionStorage.getItem(SESSION_KEY) === 'true');
+        const savedPassword = sessionStorage.getItem(PASSWORD_KEY);
+        if (savedPassword) setPassword(savedPassword);
     }, []);
 
     const onSubmit = (e: FormEvent) => {
         e.preventDefault();
         if (username === USERNAME && password === PASSWORD) {
             sessionStorage.setItem(SESSION_KEY, 'true');
+            sessionStorage.setItem(PASSWORD_KEY, password);
             setAuthed(true);
             setError(false);
         } else {
