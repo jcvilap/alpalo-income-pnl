@@ -3,17 +3,28 @@ import type { StrategyId, StrategyMetrics, StrategyTrade } from './types';
 /**
  * Compute aggregate P&L metrics for a set of trades of one strategy.
  *
- * Win rate, avg win/loss, and profit factor are computed over CLOSED trades
- * only (open trades have no realized P&L yet). Open trades are still counted in
- * totalTrades / openTrades for context.
+ * By default, win rate, avg win/loss, and totals are computed over CLOSED
+ * trades only (realized P&L) — open trades are still counted in
+ * totalTrades / openTrades for context but excluded from the P&L rollups.
+ *
+ * @param includeUnrealized When true, open trades with a live mark-to-market
+ * `pnl` estimate (see `applyUnrealizedPnl` in transactions/service.ts) are
+ * folded into every P&L figure alongside closed trades — "Total P&L" becomes
+ * realized + unrealized, win rate includes currently-winning open positions,
+ * etc. Off by default so the tiles show realized performance unless the user
+ * opts in.
  */
-export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[]): StrategyMetrics {
+export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[], includeUnrealized = false): StrategyMetrics {
     const closed = trades.filter(t => t.status === 'closed' && typeof t.pnl === 'number');
+    const openWithPnl = includeUnrealized
+        ? trades.filter(t => t.status === 'open' && typeof t.pnl === 'number')
+        : [];
+    const counted = [...closed, ...openWithPnl];
     const openTrades = trades.length - closed.length;
 
-    const pnls = closed.map(t => t.pnl as number);
-    const wins = closed.filter(t => (t.pnl as number) > 0);
-    const losses = closed.filter(t => (t.pnl as number) < 0);
+    const pnls = counted.map(t => t.pnl as number);
+    const wins = counted.filter(t => (t.pnl as number) > 0);
+    const losses = counted.filter(t => (t.pnl as number) < 0);
     const winsArr = wins.map(t => t.pnl as number);
     const lossesArr = losses.map(t => t.pnl as number);
     const winsPctArr = wins.map(t => t.pctGain).filter((p): p is number => typeof p === 'number');
@@ -23,15 +34,15 @@ export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[]
     const grossProfit = winsArr.reduce((s, p) => s + p, 0);
     const grossLoss = Math.abs(lossesArr.reduce((s, p) => s + p, 0));
 
-    const holdDays = closed
+    const holdDays = counted
         .map(t => t.daysOpen)
         .filter((d): d is number => typeof d === 'number');
 
-    const bestTradeEntry = closed.reduce<StrategyTrade | undefined>(
+    const bestTradeEntry = counted.reduce<StrategyTrade | undefined>(
         (best, t) => (best == null || (t.pnl as number) > (best.pnl as number) ? t : best),
         undefined,
     );
-    const worstTradeEntry = closed.reduce<StrategyTrade | undefined>(
+    const worstTradeEntry = counted.reduce<StrategyTrade | undefined>(
         (worst, t) => (worst == null || (t.pnl as number) < (worst.pnl as number) ? t : worst),
         undefined,
     );
@@ -43,9 +54,9 @@ export function computeMetrics(strategies: StrategyId[], trades: StrategyTrade[]
         openTrades,
         wins: winsArr.length,
         losses: lossesArr.length,
-        winRate: closed.length > 0 ? winsArr.length / closed.length : 0,
+        winRate: counted.length > 0 ? winsArr.length / counted.length : 0,
         totalPnl,
-        avgPnl: closed.length > 0 ? totalPnl / closed.length : 0,
+        avgPnl: counted.length > 0 ? totalPnl / counted.length : 0,
         avgWin: winsArr.length > 0 ? grossProfit / winsArr.length : 0,
         avgLoss: lossesArr.length > 0 ? -grossLoss / lossesArr.length : 0,
         avgWinPct: winsPctArr.length > 0 ? winsPctArr.reduce((s, p) => s + p, 0) / winsPctArr.length : undefined,

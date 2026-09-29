@@ -35,6 +35,21 @@ export interface Leg {
     price: number;
     /** OCC option symbol as reported by Schwab. */
     symbol?: string;
+    /**
+     * This leg's own share of entry cash (-quantity * price * 100). Populated
+     * for STRANGLE legs only, so the UI's per-leg detail row can show each
+     * leg's own open/close/P&L figures — see `legNetAmount` in rules.ts and
+     * the detail-row synthesis in `TradesTable.tsx`.
+     */
+    openNet?: number;
+    /** This leg's own live mark-to-market close value, once quoted. STRANGLE legs only. */
+    closeNet?: number;
+    /** This leg's own P&L: realized (closeNet != null) or live estimate. STRANGLE legs only. */
+    pnl?: number;
+    /** True when `pnl` is a live mark-to-market estimate rather than realized cash. */
+    pnlIsEstimate?: boolean;
+    /** pnl / |openNet| as a percentage. */
+    pctGain?: number;
 }
 
 /** All legs that share one Schwab orderId. */

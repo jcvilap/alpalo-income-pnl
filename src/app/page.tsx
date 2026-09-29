@@ -1,13 +1,15 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Activity, ChevronDown, RefreshCw, TrendingUp } from 'lucide-react';
 import { StatTile } from '@/components/StatTile';
 import { EquityCurve } from '@/components/EquityCurve';
 import { TradesTable } from '@/components/TradesTable';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { LoginGate } from '@/components/LoginGate';
-import type { StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
+import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
+import { computeMetrics } from '@/lib/strategy/metrics';
 import { formatCurrency, formatNumber, formatPercent } from '@/lib/format';
 
 function formatSignedPercent(pct: number | undefined): string {
@@ -76,12 +78,51 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
     return { from: `${now.getFullYear()}-01-01`, to };
 }
 
+const VALID_PRESET_IDS = new Set<string>(RANGE_PRESETS.map((p) => p.id));
+const VALID_STRATEGY_IDS = new Set(STRATEGIES.map((s) => s.id));
+
+function readInitialState(searchParams: URLSearchParams) {
+    const presetParam = searchParams.get('preset');
+    const preset: RangePresetId = presetParam && VALID_PRESET_IDS.has(presetParam) ? (presetParam as RangePresetId) : 'YTD';
+
+    const strategyParam = searchParams.get('strategy');
+    const strategies = strategyParam
+        ? strategyParam.split(',').filter((s) => VALID_STRATEGY_IDS.has(s))
+        : [];
+
+    const fromParam = searchParams.get('from');
+    const toParam = searchParams.get('to');
+    const presetRange = rangeForPreset(preset);
+    const from = preset === 'CUSTOM' && fromParam ? fromParam : presetRange.from;
+    const to = preset === 'CUSTOM' && toParam ? toParam : presetRange.to;
+
+    return {
+        preset,
+        from,
+        to,
+        strategies: strategies.length > 0 ? strategies : ['double_calendar'],
+        includeUnrealized: searchParams.get('unrealized') === '1',
+    };
+}
+
 export default function Home() {
-    const defaults = rangeForPreset('YTD');
-    const [preset, setPreset] = useState<RangePresetId>('YTD');
-    const [from, setFrom] = useState(defaults.from);
-    const [to, setTo] = useState(defaults.to);
-    const [strategies, setStrategies] = useState<string[]>(['double_calendar']);
+    return (
+        <Suspense fallback={null}>
+            <HomeContent />
+        </Suspense>
+    );
+}
+
+function HomeContent() {
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const initial = readInitialState(searchParams);
+
+    const [preset, setPreset] = useState<RangePresetId>(initial.preset);
+    const [from, setFrom] = useState(initial.from);
+    const [to, setTo] = useState(initial.to);
+    const [strategies, setStrategies] = useState<string[]>(initial.strategies);
+    const [includeUnrealized, setIncludeUnrealized] = useState(initial.includeUnrealized);
     const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
     const strategyMenuRef = useRef<HTMLDivElement>(null);
     const [data, setData] = useState<TradesResponse | null>(null);
@@ -117,6 +158,22 @@ export default function Home() {
         void load(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Keep the URL deep-linkable: reflect the current strategy/range/toggle
+    // selection in the query string (replace, not push, so filter changes
+    // don't pile up browser-history entries).
+    useEffect(() => {
+        const params = new URLSearchParams({
+            strategy: strategies.join(','),
+            preset,
+        });
+        if (preset === 'CUSTOM') {
+            params.set('from', from);
+            params.set('to', to);
+        }
+        if (includeUnrealized) params.set('unrealized', '1');
+        router.replace(`?${params.toString()}`, { scroll: false });
+    }, [router, strategies, preset, from, to, includeUnrealized]);
 
     useEffect(() => {
         if (!strategyMenuOpen) return;
@@ -154,7 +211,13 @@ export default function Home() {
         [load, from, to],
     );
 
-    const m = data?.metrics;
+    // Recompute client-side rather than trusting `data.metrics` verbatim, so
+    // toggling "include unrealized" is instant and doesn't require a refetch
+    // — `computeMetrics` is a pure function of the already-fetched trades.
+    const m = useMemo(
+        () => (data ? computeMetrics(data.strategies as StrategyId[], data.trades, includeUnrealized) : undefined),
+        [data, includeUnrealized],
+    );
     const enabledStrategies = STRATEGIES.filter((s) => s.enabled);
     const strategyLabel =
         strategies.length === 0
@@ -275,6 +338,18 @@ export default function Home() {
                         <RefreshCw size={14} className={loading ? 'animate-spin-slow' : ''} />
                         Refresh
                     </button>
+                    <label
+                        className="flex items-center gap-2 text-sm cursor-pointer h-9 px-1"
+                        style={{ color: 'var(--color-text-secondary)' }}
+                        title="Blend live mark-to-market P&L from open trades into the totals below"
+                    >
+                        <input
+                            type="checkbox"
+                            checked={includeUnrealized}
+                            onChange={(e) => setIncludeUnrealized(e.target.checked)}
+                        />
+                        Include unrealized P&amp;L
+                    </label>
                     {data && (
                         <span className="text-xs ml-auto self-center" style={{ color: 'var(--color-text-tertiary)' }}>
                             {data.cached ? 'cached' : 'live'} · {data.trades.length} trades

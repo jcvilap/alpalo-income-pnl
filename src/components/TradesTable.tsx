@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
+import { differenceInCalendarDays, parseISO } from 'date-fns';
 import {
     type ColumnDef,
     type GroupingState,
@@ -67,6 +68,60 @@ function orderByPinning<T extends { column: { getIsPinned: () => 'left' | 'right
 }
 
 const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations']);
+
+/** True for trades that can show a per-leg breakdown row: strangles only (open or closed). */
+function hasLegDetail(trade: StrategyTrade): boolean {
+    return trade.strategy === 'STRANGLE';
+}
+
+/**
+ * Minimal stand-in for TanStack's CellContext so a synthetic per-leg row can
+ * be rendered through the real column cell renderers without spinning up a
+ * second `useReactTable` instance. Every column def here only reads
+ * `getValue()` and `row.original` — nothing else of CellContext is needed.
+ */
+function fakeCellContext(columnId: string, trade: StrategyTrade) {
+    return {
+        getValue: () => (trade as unknown as Record<string, unknown>)[columnId],
+        row: { original: trade },
+    } as never;
+}
+
+/** Remaining calendar days to `expiration`, measured from now, floored at 0. */
+function remainingDte(expiration: string): number | undefined {
+    try {
+        return Math.max(0, differenceInCalendarDays(parseISO(expiration), new Date()));
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Build one synthetic per-leg "trade" per leg of a still-open strangle, so
+ * the detail row can render through the exact same column defs as the parent
+ * row instead of duplicating cell markup. Each leg's own strike/expiration/
+ * openNet/pnl/pctGain (stamped server-side — see pairing.ts and service.ts's
+ * `applyUnrealizedPnl`) stand in for the parent trade's aggregate fields;
+ * everything else (status, dates, strategy) is inherited from the parent.
+ */
+function legDetailRows(trade: StrategyTrade): StrategyTrade[] {
+    return trade.legs.map((leg, i) => ({
+        ...trade,
+        id: `${trade.id}-leg-${i}`,
+        status: leg.openClose === 'CLOSE' ? 'closed' : 'open',
+        legs: [leg],
+        strikes: [leg.strike],
+        expirations: [leg.expiration],
+        expirationDtes: [trade.expirationDtes[trade.expirations.indexOf(leg.expiration)] ?? 0],
+        dte: leg.openClose === 'CLOSE' ? undefined : remainingDte(leg.expiration),
+        contracts: Math.abs(leg.quantity),
+        openNet: leg.openNet ?? 0,
+        closeNet: leg.closeNet,
+        pnl: leg.pnl,
+        pnlIsEstimate: leg.pnlIsEstimate,
+        pctGain: leg.pctGain,
+    }));
+}
 
 const columns: ColumnDef<StrategyTrade>[] = [
     {
@@ -230,6 +285,16 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
     const [globalFilter, setGlobalFilter] = useState('');
     const [statusFilter, setStatusFilter] = useState<'all' | 'open' | 'closed'>('all');
     const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+    const [expandedLegRows, setExpandedLegRows] = useState<Set<string>>(new Set());
+
+    const toggleLegRow = (id: string) => {
+        setExpandedLegRows((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    };
 
     const filtered = useMemo(
         () => (statusFilter === 'all' ? trades : trades.filter((t) => t.status === statusFilter)),
@@ -350,48 +415,100 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
                             ))}
                         </thead>
                         <tbody>
-                            {table.getRowModel().rows.map((row) => (
-                                <tr
-                                    key={row.id}
-                                    style={{
-                                        borderTop: '1px solid var(--color-border-light)',
-                                        color: 'var(--color-text-primary)',
-                                        background: row.getIsGrouped() ? 'var(--color-surface-hover)' : undefined,
-                                    }}
-                                >
-                                    {orderByPinning(row.getVisibleCells()).map((cell) => {
-                                        const numeric = !NON_NUMERIC_COLUMNS.has(cell.column.id);
-                                        const pinnedSide = cell.column.getIsPinned();
-                                        return (
-                                            <td
-                                                key={cell.id}
-                                                className={`px-3 py-2 ${numeric ? 'text-right' : 'text-left'}`}
-                                                style={{
-                                                    whiteSpace: 'nowrap',
-                                                    ...pinnedStyle(pinnedSide, pinnedSide === 'right' ? cell.column.getAfter('right') : cell.column.getStart('left'), row.getIsGrouped()),
-                                                }}
-                                            >
-                                                {cell.getIsGrouped() ? (
-                                                    <button
-                                                        onClick={row.getToggleExpandedHandler()}
-                                                        className="inline-flex items-center gap-1 font-semibold cursor-pointer"
+                            {table.getRowModel().rows.map((row) => {
+                                const showLegToggle = !row.getIsGrouped() && hasLegDetail(row.original);
+                                const legRowExpanded = showLegToggle && expandedLegRows.has(row.id);
+                                return (
+                                    <Fragment key={row.id}>
+                                        <tr
+                                            style={{
+                                                borderTop: '1px solid var(--color-border-light)',
+                                                color: 'var(--color-text-primary)',
+                                                background: row.getIsGrouped() ? 'var(--color-surface-hover)' : undefined,
+                                            }}
+                                        >
+                                            {orderByPinning(row.getVisibleCells()).map((cell) => {
+                                                const numeric = !NON_NUMERIC_COLUMNS.has(cell.column.id);
+                                                const pinnedSide = cell.column.getIsPinned();
+                                                const isUnderlyingCell = cell.column.id === 'underlying';
+                                                return (
+                                                    <td
+                                                        key={cell.id}
+                                                        className={`px-3 py-2 ${numeric ? 'text-right' : 'text-left'}`}
+                                                        style={{
+                                                            whiteSpace: 'nowrap',
+                                                            ...pinnedStyle(pinnedSide, pinnedSide === 'right' ? cell.column.getAfter('right') : cell.column.getStart('left'), row.getIsGrouped()),
+                                                        }}
                                                     >
-                                                        {row.getIsExpanded() ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                                                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                                                        <span className="text-xs font-normal" style={{ color: 'var(--color-text-tertiary)' }}>
-                                                            ({row.subRows.length})
-                                                        </span>
-                                                    </button>
-                                                ) : cell.getIsAggregated() ? (
-                                                    flexRender(cell.column.columnDef.aggregatedCell ?? cell.column.columnDef.cell, cell.getContext())
-                                                ) : cell.getIsPlaceholder() ? null : (
-                                                    flexRender(cell.column.columnDef.cell, cell.getContext())
-                                                )}
-                                            </td>
-                                        );
-                                    })}
-                                </tr>
-                            ))}
+                                                        {cell.getIsGrouped() ? (
+                                                            <button
+                                                                onClick={row.getToggleExpandedHandler()}
+                                                                className="inline-flex items-center gap-1 font-semibold cursor-pointer"
+                                                            >
+                                                                {row.getIsExpanded() ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                                                <span className="text-xs font-normal" style={{ color: 'var(--color-text-tertiary)' }}>
+                                                                    ({row.subRows.length})
+                                                                </span>
+                                                            </button>
+                                                        ) : cell.getIsAggregated() ? (
+                                                            flexRender(cell.column.columnDef.aggregatedCell ?? cell.column.columnDef.cell, cell.getContext())
+                                                        ) : cell.getIsPlaceholder() ? null : isUnderlyingCell && showLegToggle ? (
+                                                            <button
+                                                                onClick={() => toggleLegRow(row.id)}
+                                                                className="inline-flex items-center gap-1 cursor-pointer"
+                                                            >
+                                                                {legRowExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                                            </button>
+                                                        ) : (
+                                                            flexRender(cell.column.columnDef.cell, cell.getContext())
+                                                        )}
+                                                    </td>
+                                                );
+                                            })}
+                                        </tr>
+                                        {legRowExpanded &&
+                                            legDetailRows(row.original).map((legTrade, i) => (
+                                                <tr
+                                                    key={`${row.id}-leg-${i}`}
+                                                    style={{ background: 'var(--color-surface-hover)' }}
+                                                >
+                                                    {orderByPinning(row.getVisibleCells()).map((cell) => {
+                                                        const numeric = !NON_NUMERIC_COLUMNS.has(cell.column.id);
+                                                        const pinnedSide = cell.column.getIsPinned();
+                                                        const isUnderlyingCell = cell.column.id === 'underlying';
+                                                        const legCtx = fakeCellContext(cell.column.id, legTrade);
+                                                        return (
+                                                            <td
+                                                                key={`${cell.id}-leg-${i}`}
+                                                                className={`px-3 py-2 text-xs ${numeric ? 'text-right' : 'text-left'}`}
+                                                                style={{
+                                                                    whiteSpace: 'nowrap',
+                                                                    ...pinnedStyle(pinnedSide, pinnedSide === 'right' ? cell.column.getAfter('right') : cell.column.getStart('left'), false),
+                                                                }}
+                                                            >
+                                                                {isUnderlyingCell ? (
+                                                                    <span className="pl-5 inline-flex items-center gap-1.5">
+                                                                        {flexRender(cell.column.columnDef.cell, legCtx)}
+                                                                        <span
+                                                                            className="text-[10px] font-medium uppercase tracking-wide"
+                                                                            style={{ color: 'var(--color-text-tertiary)' }}
+                                                                        >
+                                                                            {legTrade.legs[0].right}
+                                                                        </span>
+                                                                    </span>
+                                                                ) : (
+                                                                    flexRender(cell.column.columnDef.cell, legCtx)
+                                                                )}
+                                                            </td>
+                                                        );
+                                                    })}
+                                                </tr>
+                                            ))}
+                                    </Fragment>
+                                );
+                            })}
                         </tbody>
                     </table>
                 </div>

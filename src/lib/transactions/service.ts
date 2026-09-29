@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v9';
+const STRATEGY_VERSION = 'v16';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -162,7 +162,9 @@ async function applyUnrealizedPnl(
     if (openTrades.length === 0) return;
 
     const symbols = Array.from(
-        new Set(openTrades.flatMap(t => t.legs.map(l => l.symbol).filter((s): s is string => !!s))),
+        new Set(
+            openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.symbol)).filter((s): s is string => !!s),
+        ),
     );
     if (symbols.length === 0) return;
 
@@ -188,20 +190,50 @@ async function applyUnrealizedPnl(
     for (const trade of openTrades) {
         let closeValue = 0;
         let missingQuote = false;
+        // A STRANGLE's `legs` may include legs already closed independently
+        // (see pairing.ts's `closeStrangleLeg`/`closedLegs`) — those already
+        // carry final realized openNet/closeNet/pnl and must not be re-priced,
+        // but their locked-in P&L still has to count toward the whole trade's
+        // total below (realizedLegPnl), not just the still-open leg's live mark.
+        let realizedLegPnl = 0;
         for (const leg of trade.legs) {
+            if (leg.openClose === 'CLOSE') {
+                if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
+                continue;
+            }
             const quote = leg.symbol ? quotes[leg.symbol] : undefined;
             if (!quote || typeof quote.mark !== 'number') {
                 missingQuote = true;
                 break;
             }
             closeValue += leg.quantity * quote.mark * OPTION_MULTIPLIER;
+
+            // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
+            // detail row. Same math as the whole-trade figure below, just
+            // scoped to this one leg's own openNet/closeValue.
+            if (trade.strategy === 'STRANGLE' && leg.openNet != null) {
+                const legCloseValue = leg.quantity * quote.mark * OPTION_MULTIPLIER;
+                const legPnl = leg.openNet + legCloseValue;
+                leg.closeNet = legCloseValue;
+                leg.pnl = legPnl;
+                leg.pnlIsEstimate = true;
+                leg.pctGain = leg.openNet !== 0 ? (legPnl / Math.abs(leg.openNet)) * 100 : undefined;
+            }
         }
         if (missingQuote) continue;
 
-        const pnl = trade.openNet + closeValue;
+        // Whole-trade P&L = live mark-to-market of the still-open leg(s) plus
+        // any already-locked-in P&L from a leg closed independently earlier —
+        // otherwise a strangle with one leg already closed would silently
+        // drop that realized profit/loss from its total. `trade.openNet` here
+        // is already just the still-open leg's own share (see
+        // `OpenLot.remainingOpenNet` in pairing.ts), so it only pairs with
+        // `closeValue`; `realizedLegPnl` is added on top, not blended in.
+        const pnl = trade.openNet + closeValue + realizedLegPnl;
         trade.pnl = pnl;
         trade.pnlIsEstimate = true;
-        trade.pctGain = trade.openNet !== 0 ? (pnl / Math.abs(trade.openNet)) * 100 : undefined;
+        const totalOpenNet = trade.openNet + trade.legs.filter(l => l.openClose === 'CLOSE').reduce((s, l) => s + (l.openNet ?? 0), 0);
+        trade.pctGain = totalOpenNet !== 0 ? (pnl / Math.abs(totalOpenNet)) * 100 : undefined;
     }
 }
 
