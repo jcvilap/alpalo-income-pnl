@@ -601,6 +601,11 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
     }
 
     // Any remaining open lots are still-open trades (using their remaining share of open net).
+    // Note: a lot whose only still-open leg(s) have already passed expiration is *not* flipped
+    // to closed here — pairing.ts has no live price, so it can't tell a worthless OTM expiration
+    // (safe to value at $0) from an ITM assignment/exercise (real settlement value, not $0).
+    // `applyUnrealizedPnl` in transactions/service.ts does that check with a live quote and
+    // flips status there instead — see its handling of `expired` legs.
     for (const q of openQueues.values()) {
         for (const lot of q) {
             const openShare = lot.remainingOpenNet ?? (lot.remainingContracts / lot.totalContracts) * lot.match.order.netAmount;
@@ -624,7 +629,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
     return trades.sort((a, b) => (b.openedAt ?? '').localeCompare(a.openedAt ?? ''));
 }
 
-function safeHoldDays(open: string, close: string): number {
+export function safeHoldDays(open: string, close: string): number {
     try {
         return Math.max(0, differenceInCalendarDays(parseISO(close), parseISO(open)));
     } catch {

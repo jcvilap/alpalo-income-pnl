@@ -4,12 +4,12 @@ import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/
 import { SchwabClient, type SchwabQuote, type SchwabTransaction } from '@/live/schwabClient';
 import { withRedis } from '@/lib/redis';
 import { normalizeToOrderGroups } from '@/lib/strategy/normalize';
-import { buildTrades } from '@/lib/strategy/pairing';
+import { buildTrades, safeHoldDays } from '@/lib/strategy/pairing';
 import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v22';
+const STRATEGY_VERSION = 'v23';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -235,6 +235,15 @@ async function applyUnrealizedPnl(
         // but their locked-in P&L still has to count toward the whole trade's
         // total below (realizedLegPnl), not just the still-open leg's live mark.
         let realizedLegPnl = 0;
+        // Tracks whether every still-open leg has both expired *and* been
+        // confirmed out-of-the-money (not just expired — an ITM leg would
+        // have settled via assignment/exercise for real value, not $0) — see
+        // the status-flip check after this loop. `openLegCount` guards
+        // against flipping a trade with zero still-open legs (shouldn't
+        // happen, but a wrongly-empty `legs` shouldn't silently look "done").
+        let openLegCount = 0;
+        let allExpiredWorthless = true;
+        let latestExpiration: string | null = null;
         for (const leg of trade.legs) {
             if (leg.openClose === 'CLOSE') {
                 if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
@@ -278,6 +287,18 @@ async function applyUnrealizedPnl(
             const mark = hasQuote ? quote!.mark! : 0;
             closeValue += leg.quantity * mark * OPTION_MULTIPLIER;
 
+            openLegCount++;
+            if (!latestExpiration || leg.expiration > latestExpiration) latestExpiration = leg.expiration;
+            // Confirmed worthless requires both: expired (no longer
+            // tradeable) AND known to be OTM (leg.itm === false, not just
+            // undefined — an ITM leg settles via assignment/exercise for
+            // real value, so treating it as a $0 close would be wrong; see
+            // Codex's PR #9 review). A leg still priced by a live quote
+            // despite being past expiration (e.g. same-day expiry still
+            // settling) isn't "confirmed worthless" either — its mark is the
+            // real closing value, not a synthesized $0.
+            if (!(expired && !hasQuote && leg.itm === false)) allExpiredWorthless = false;
+
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just
             // scoped to this one leg's own openNet/closeValue.
@@ -301,9 +322,27 @@ async function applyUnrealizedPnl(
         // `closeValue`; `realizedLegPnl` is added on top, not blended in.
         const pnl = trade.openNet + closeValue + realizedLegPnl;
         trade.pnl = pnl;
-        trade.pnlIsEstimate = true;
         const totalOpenNet = trade.openNet + trade.legs.filter(l => l.openClose === 'CLOSE').reduce((s, l) => s + (l.openNet ?? 0), 0);
         trade.pctGain = totalOpenNet !== 0 ? (pnl / Math.abs(totalOpenNet)) * 100 : undefined;
+
+        // Every still-open leg confirmed expired-and-OTM (see the per-leg
+        // loop above) means the position is genuinely done — Schwab just
+        // never generated an explicit closing transaction for the worthless
+        // expiration. Flip it to closed with a real (not estimated) $0
+        // close instead of leaving it looking perpetually "open". `daysOpen`
+        // uses the latest leg expiration, not wall-clock "now" — otherwise
+        // an already-finished trade's holding period would keep growing
+        // every day it's reparsed. A trade with zero still-open legs is left
+        // untouched (shouldn't happen for a `status: 'open'` trade, but
+        // isn't grounds to synthesize a close either).
+        if (openLegCount > 0 && allExpiredWorthless && latestExpiration) {
+            trade.status = 'closed';
+            trade.closedAt = latestExpiration;
+            trade.closeNet = 0;
+            trade.daysOpen = safeHoldDays(trade.openedAt, latestExpiration);
+        } else {
+            trade.pnlIsEstimate = true;
+        }
     }
 }
 

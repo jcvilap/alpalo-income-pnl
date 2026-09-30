@@ -100,18 +100,22 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
  * though: it's the leg on each side (call/put) with the *nearer*
  * expiration — the wing is always the farther-dated leg by construction of
  * a time-spread (see `detectTimeSpread` in rules.ts). Derive bounds from
- * that instead of array position. Returns null when there aren't at least 2
- * distinct strikes among the strategy's OPEN legs.
+ * that instead of array position.
+ *
+ * Uses every leg, not just still-open ones: a strangle with one leg closed
+ * early (see `closeStrangleLeg` in pairing.ts) still has a meaningful
+ * original range to show against the live price — only a leg's own P&L
+ * stops updating once it's closed, not the strategy's strike shape. Returns
+ * null when there aren't at least 2 distinct strikes at all.
  */
 function innerStrikes(legs: Leg[]): [number, number] | null {
-    const openLegs = legs.filter(l => l.openClose === 'OPEN');
-    const strikes = Array.from(new Set(openLegs.map(l => l.strike))).sort((a, b) => a - b);
+    const strikes = Array.from(new Set(legs.map(l => l.strike))).sort((a, b) => a - b);
     if (strikes.length < 2) return null;
     if (strikes.length === 2) return [strikes[0], strikes[1]];
 
     // 4+ strikes: pick each side's nearest-expiration leg as its bound.
     const nearestBySide = (right: 'CALL' | 'PUT'): number | null => {
-        const sideLegs = openLegs.filter(l => l.right === right);
+        const sideLegs = legs.filter(l => l.right === right);
         if (sideLegs.length === 0) return null;
         return sideLegs.reduce((nearest, l) => (l.expiration < nearest.expiration ? l : nearest)).strike;
     };
