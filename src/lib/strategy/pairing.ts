@@ -266,41 +266,36 @@ function pctGain(pnl: number | undefined, openNet: number): number | undefined {
  * legs instead.
  *
  * Contracts are consumed FIFO across all open STRANGLE lots that currently
- * hold this exact leg (right/strike/expiration under this underlying). Each
- * consumed leg-slice gets its own realized trade: that leg's original entry
- * cash share (via `legNetAmount`, scaled to the consumed quantity) plus this
- * close order's cash. The lot itself shrinks in place — if this was its last
- * remaining leg the lot is fully closed and dropped from the queue; otherwise
- * it stays open, now representing just its remaining leg(s).
- *
- * Returns null if this leg doesn't match any currently-open STRANGLE lot
- * (e.g. a naked option unrelated to any tracked strangle) — the caller then
- * leaves the order unclassified, same as today.
+ * hold this exact leg (right/strike/expiration under this underlying) — this
+ * can span *multiple distinct lots* (e.g. two separate strangle positions
+ * opened on different days, both still holding this same leg), not just
+ * multiple legs of one lot. Each lot's own completion is tracked
+ * independently: a lot only emits a closed trade once *its own* other leg is
+ * also done, regardless of whether a *different* lot touched by this same
+ * order still has an open sibling. Returns one trade per lot this order
+ * fully completes (usually zero or one, but can be more than one if a single
+ * close order happens to finish off several lots at once), or an empty array
+ * if no lot was fully completed (either no lot matched, or every touched lot
+ * still has a leg open afterward).
  */
 function closeStrangleLeg(
     order: OrderGroup,
     closingLeg: Leg,
     openQueues: Map<string, OpenLot[]>,
-): StrategyTrade | null {
+): StrategyTrade[] {
     const targetSig = legSignature(order.underlying, closingLeg);
     let remainingToClose = Math.abs(closingLeg.quantity);
-    if (remainingToClose === 0) return null;
+    if (remainingToClose === 0) return [];
     const totalCloseContracts = remainingToClose;
 
-    let openShareTotal = 0;
-    let firstLot: OpenLot | null = null;
-    let earliestOpenTime: string | null = null;
-    // The strangle's other leg(s) — still open, or already closed
-    // independently before this order — carried over so the returned trade
-    // always shows both of the strangle's original legs, even when this
-    // close finishes off the lot's last remaining leg and the lot itself is
-    // about to be discarded.
-    let siblingLegs: Leg[] = [];
-    // True once any lot this close touches still has an open leg remaining
-    // afterward — that lot's realized P&L will resurface via `realizedLegPnl`
-    // on its still-open sibling trade (see `applyUnrealizedPnl`), so this
-    // standalone record must not also count in aggregate metrics.
-    let hasOpenSibling = false;
+    // One entry per lot this order actually consumes from, tracked
+    // independently — a completed lot's totals must never be blended with
+    // another lot's (see the multi-lot bug this replaced: a shared
+    // "any lot still has an open sibling" flag could suppress an already-
+    // completed lot's own closed trade just because a *different* lot
+    // touched by the same order was still partial).
+    interface LotClose { lot: OpenLot; openShare: number; closeShare: number; closedLeg: Leg; completed: boolean }
+    const lotCloses: LotClose[] = [];
 
     for (const q of openQueues.values()) {
         for (let i = 0; i < q.length && remainingToClose > 0; ) {
@@ -325,15 +320,7 @@ function closeStrangleLeg(
             // opening order's total gross cash across both legs.
             const grossWeight = legWeight(leg, lot.match.order.legs);
             const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
-            openShareTotal += legOpenShare;
             if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
-            if (!firstLot) firstLot = lot;
-            if (!earliestOpenTime || lot.match.order.time < earliestOpenTime) earliestOpenTime = lot.match.order.time;
-            siblingLegs = [
-                ...siblingLegs,
-                ...legs.filter((_, idx) => idx !== legIdx),
-                ...(lot.closedLegs ?? []),
-            ];
 
             // This lot's own share of the close order's cash, proportional to
             // how much of the close this lot's leg actually consumed — needed
@@ -364,89 +351,82 @@ function closeStrangleLeg(
             remainingToClose -= consumed;
 
             // Lot is fully closed once it has no legs and no other open contracts left.
-            if (legs.length === 0) {
+            const completed = legs.length === 0;
+            if (completed) {
                 lot.remainingContracts = 0;
                 q.splice(i, 1);
-                continue;
+            } else {
+                i++;
             }
-            hasOpenSibling = true;
-            i++;
+            lotCloses.push({ lot, openShare: legOpenShare, closeShare: legCloseShare, closedLeg, completed });
         }
     }
 
-    if (!firstLot) return null;
+    const results: StrategyTrade[] = [];
+    for (const { lot, openShare, closeShare, closedLeg, completed } of lotCloses) {
+        // This lot still has an open leg after this close — its own eventual
+        // trade record (still open, or later finalized once the sibling also
+        // closes) already carries this closed leg's locked-in data via
+        // `lot.closedLegs` + `toTradeShape`. A strangle is exactly one row
+        // with exactly two legs, one closed one open, until both are closed
+        // — not two separate rows duplicating the same position.
+        if (!completed) continue;
 
-    // If the lot still has an open leg after this close, don't also emit a
-    // standalone trade for it — the closed leg's locked-in data already
-    // lives on `lot.closedLegs` (set above) and flows into the lot's own
-    // eventual trade record (still open, or later finalized once the
-    // sibling also closes) via `toTradeShape`'s `closedLegs` param. A
-    // strangle is exactly one row with exactly two legs, one closed one
-    // open, until both are closed — not two separate rows duplicating the
-    // same position (see AGENTS.md-worthy note: this used to emit both,
-    // which produced mismatched timelines/expand arrows across the two
-    // records once the still-open leg later finalized independently).
-    if (hasOpenSibling) return null;
+        const pnl = openShare + closeShare;
+        const daysOpen = safeHoldDays(lot.match.order.time, order.time);
+        const thisClosedLeg: Leg = { ...closingLeg, ...closedLeg };
 
-    const consumedContracts = totalCloseContracts - remainingToClose;
-    const closeShare = (consumedContracts / totalCloseContracts) * order.netAmount;
-    const pnl = openShareTotal + closeShare;
-    const daysOpen = earliestOpenTime ? safeHoldDays(earliestOpenTime, order.time) : 0;
+        // This lot's sibling leg(s) may have already closed independently
+        // *before* this order (a separate single-leg close) — that realized
+        // cash lives only in `lot.closedLegs` and must be folded into this
+        // lot's own totals, or it would silently vanish from both the table
+        // and aggregate metrics once this lot is discarded and never
+        // revisited (see Codex's PR #10 review).
+        const siblingClosedLegs = (lot.closedLegs ?? []).filter(l => l !== closedLeg);
+        const siblingOpenNet = siblingClosedLegs.reduce((s, l) => s + (l.openNet ?? 0), 0);
+        const siblingCloseNet = siblingClosedLegs.reduce((s, l) => s + (l.closeNet ?? 0), 0);
+        const totalOpenNet = openShare + siblingOpenNet;
+        const totalCloseNet = closeShare + siblingCloseNet;
+        const totalPnl = pnl + siblingClosedLegs.reduce((s, l) => s + (l.pnl ?? 0), 0);
 
-    const thisClosedLeg: Leg = { ...closingLeg, closedAt: order.time, openNet: openShareTotal, closeNet: closeShare, pnl, pctGain: pctGain(pnl, openShareTotal) };
+        // `lot.closedLegs` holds the actual leg objects other code paths
+        // (e.g. a still-open sibling trade, before this lot completed) may
+        // also reference — shallow-copy before handing them to this
+        // historical record so a later mutation elsewhere can't bleed in.
+        const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...(lot.closedLegs ?? []).map(l => ({ ...l }))]);
+        const strikes = distinctSorted(allLegs.map(l => l.strike));
+        const expirations = distinctSorted(allLegs.map(l => l.expiration));
+        const openedAt = lot.match.order.time;
 
-    // If a sibling leg already closed independently *before* this order (a
-    // separate single-leg close, not this same close order), its realized
-    // cash lives only in `siblingLegs`/`lot.closedLegs` — `openShareTotal`/
-    // `closeShare`/`pnl` above only ever tracked *this* close's own leg.
-    // Without folding it in here, the whole trade's totals (and therefore
-    // aggregate metrics) would silently drop that leg's entire realized
-    // P&L once this close finishes the lot and it's never touched again
-    // (see Codex's PR #10 review).
-    const alreadyClosedSiblings = siblingLegs.filter(l => l.openClose === 'CLOSE');
-    const siblingOpenNet = alreadyClosedSiblings.reduce((s, l) => s + (l.openNet ?? 0), 0);
-    const siblingCloseNet = alreadyClosedSiblings.reduce((s, l) => s + (l.closeNet ?? 0), 0);
-    const totalOpenNet = openShareTotal + siblingOpenNet;
-    const totalCloseNet = closeShare + siblingCloseNet;
-    const totalPnl = pnl + alreadyClosedSiblings.reduce((s, l) => s + (l.pnl ?? 0), 0);
-    // Always both of the strangle's original legs: this close plus its
-    // sibling leg (still open, or already closed independently), deduped by
-    // signature in case FIFO spanned lots with overlapping legs. `siblingLegs`
-    // holds live references into `lot.openLegs`/`lot.closedLegs` — the same
-    // objects the still-open sibling trade keeps mutating (e.g. when it
-    // later finalizes an expired leg, see `applyUnrealizedPnl` in
-    // transactions/service.ts) — so this standalone historical record must
-    // shallow-copy them, or a mutation made for the *other* trade's context
-    // (a different closedAt/timeline) would silently bleed into this one's
-    // display too.
-    const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...siblingLegs.map(l => ({ ...l }))]);
-    const strikes = distinctSorted(allLegs.map(l => l.strike));
-    const expirations = distinctSorted(allLegs.map(l => l.expiration));
-
-    const openedAt = earliestOpenTime ?? order.time;
-    return {
-        id: `strangle-leg-close-${order.orderId}-${closingLeg.strike}-${closingLeg.right}`,
-        strategy: 'STRANGLE',
-        underlying: order.underlying,
-        status: 'closed',
-        openOrderId: firstLot.match.order.orderId,
-        openedAt,
-        openNet: totalOpenNet,
-        closeOrderId: order.orderId,
-        closedAt: order.time,
-        closeNet: totalCloseNet,
-        pnl: totalPnl,
-        pctGain: pctGain(totalPnl, totalOpenNet),
-        daysOpen,
-        excludeFromMetrics: hasOpenSibling,
-        legs: allLegs,
-        strikes,
-        expirations,
-        // DTE-at-open, not at this close — same contract as every other
-        // trade's `expirationDtes` (see StrategyTrade.expirationDtes).
-        expirationDtes: expirations.map(e => daysAt(openedAt, e)),
-        contracts: consumedContracts,
-    };
+        results.push({
+            // Includes the opening lot's own orderId, not just this close's
+            // — a single close order can legitimately complete more than one
+            // distinct lot (e.g. two separate strangle positions opened on
+            // different days, both holding this same leg), which would
+            // otherwise collide on an id keyed by the close order alone.
+            id: `strangle-leg-close-${order.orderId}-${lot.match.order.orderId}-${closingLeg.strike}-${closingLeg.right}`,
+            strategy: 'STRANGLE',
+            underlying: order.underlying,
+            status: 'closed',
+            openOrderId: lot.match.order.orderId,
+            openedAt,
+            openNet: totalOpenNet,
+            closeOrderId: order.orderId,
+            closedAt: order.time,
+            closeNet: totalCloseNet,
+            pnl: totalPnl,
+            pctGain: pctGain(totalPnl, totalOpenNet),
+            daysOpen,
+            legs: allLegs,
+            strikes,
+            expirations,
+            // DTE-at-open, not at this close — same contract as every other
+            // trade's `expirationDtes` (see StrategyTrade.expirationDtes).
+            expirationDtes: expirations.map(e => daysAt(openedAt, e)),
+            contracts: Math.abs(closedLeg.quantity),
+        });
+    }
+    return results;
 }
 
 /** Dedupe legs by right/strike/expiration, keeping the first occurrence. */
@@ -515,8 +495,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
         // per-leg lookup against currently-open strangle lots instead of a
         // whole-signature match. See `closeStrangleLeg`.
         if (orderMatches.length === 0 && order.legs.length === 1 && order.legs[0].openClose === 'CLOSE') {
-            const closed = closeStrangleLeg(order, order.legs[0], openQueues);
-            if (closed) trades.push(closed);
+            trades.push(...closeStrangleLeg(order, order.legs[0], openQueues));
             continue;
         }
 
