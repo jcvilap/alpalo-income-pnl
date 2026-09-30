@@ -152,7 +152,7 @@ export async function getTrades(opts: {
         // reflects *today's* price, not the price at its own expiration, so
         // a later price move could otherwise flip an already-settled
         // position's classification back and forth on every reparse.
-        const finalized = await applyUnrealizedPnl(allTrades, account, redis);
+        const finalized = await applyUnrealizedPnl(allTrades, account, redis, opts.to);
         if (finalized) {
             await writeJson(redis, pKey, { strategies, range: { from: fetchFrom, to: opts.to }, trades: allTrades, cached: false, fetchedAt } as TradesResult, PARSED_TTL_SECONDS);
         }
@@ -195,6 +195,18 @@ async function applyUnrealizedPnl(
     trades: StrategyTrade[],
     account: AccountConfig,
     redis: RedisClientType,
+    /**
+     * The raw-transaction fetch's own horizon (`opts.to` from `getTrades`) —
+     * the last date we actually asked Schwab for closing transactions. A
+     * leg expiring after this date can't be "confirmed to have no closing
+     * transaction", because we never fetched far enough to find one if it
+     * existed; only expirations on or before this horizon are eligible for
+     * the expired-worthless finalization below. Wall-clock "now" alone
+     * isn't a safe substitute — a custom report range ending in the past
+     * would otherwise let this fire for expirations we haven't looked at
+     * yet (see Codex's PR #9 review).
+     */
+    fetchHorizon: string,
 ): Promise<boolean> {
     let anyFinalized = false;
     const openTrades = trades.filter(t => t.status === 'open');
@@ -308,15 +320,21 @@ async function applyUnrealizedPnl(
             openLegCount++;
             stillOpenLegs.push(leg);
             if (!latestExpiration || leg.expiration > latestExpiration) latestExpiration = leg.expiration;
-            // Confirmed worthless requires both: expired (no longer
-            // tradeable) AND known to be OTM (leg.itm === false, not just
-            // undefined — an ITM leg settles via assignment/exercise for
-            // real value, so treating it as a $0 close would be wrong; see
-            // Codex's PR #9 review). A leg still priced by a live quote
-            // despite being past expiration (e.g. same-day expiry still
-            // settling) isn't "confirmed worthless" either — its mark is the
-            // real closing value, not a synthesized $0.
-            if (!(expired && !hasQuote && leg.itm === false)) allExpiredWorthless = false;
+            // Confirmed worthless requires: expired (no longer tradeable),
+            // known to be OTM (leg.itm === false, not just undefined — an
+            // ITM leg settles via assignment/exercise for real value, so
+            // treating it as a $0 close would be wrong), AND within the
+            // horizon we actually fetched closing transactions through
+            // (`fetchHorizon` — a custom report ending in the past hasn't
+            // looked far enough ahead to rule out a real close existing
+            // after it, so "no closing transaction found" isn't a safe
+            // conclusion past that point; see Codex's PR #9 review). A leg
+            // still priced by a live quote despite being past expiration
+            // (e.g. same-day expiry still settling) isn't "confirmed
+            // worthless" either — its mark is the real closing value, not a
+            // synthesized $0.
+            const expiredWithinFetchedHorizon = expired && leg.expiration <= fetchHorizon;
+            if (!(expiredWithinFetchedHorizon && !hasQuote && leg.itm === false)) allExpiredWorthless = false;
 
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just
