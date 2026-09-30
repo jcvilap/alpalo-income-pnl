@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v25';
+const STRATEGY_VERSION = 'v26';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -112,7 +112,7 @@ interface FinalizedTrade {
     pctGain?: number;
     daysOpen: number;
     /** Per-leg finalized fields, matched back onto `trade.legs` by (right, strike, expiration) since leg array order isn't guaranteed stable. */
-    legs: { right: string; strike: number; expiration: string; closeNet: number; pnl: number; pctGain?: number }[];
+    legs: { right: string; strike: number; expiration: string; closedAt: string; closeNet: number; pnl: number; pctGain?: number }[];
 }
 
 /**
@@ -282,6 +282,7 @@ function applyFinalizedRecord(trade: StrategyTrade, record: FinalizedTrade): voi
         );
         if (!finalizedLeg) continue;
         leg.openClose = 'CLOSE';
+        leg.closedAt = finalizedLeg.closedAt;
         leg.closeNet = finalizedLeg.closeNet;
         leg.pnl = finalizedLeg.pnl;
         leg.pctGain = finalizedLeg.pctGain;
@@ -560,6 +561,11 @@ async function applyUnrealizedPnl(
             // TradesTable.tsx reads these fields directly off the leg).
             for (const leg of stillOpenLegs) {
                 leg.openClose = 'CLOSE';
+                // This leg's own close date is its own expiration — not
+                // necessarily `latestExpiration` (the trade-level value),
+                // which is the *latest* across all still-open legs and only
+                // matches this leg's own date when there's just one.
+                leg.closedAt = `${leg.expiration}T23:59:59.999Z`;
                 leg.closeNet = 0;
                 leg.pnl = leg.openNet ?? 0;
                 leg.pnlIsEstimate = false;
@@ -590,7 +596,7 @@ async function applyUnrealizedPnl(
                 daysOpen: trade.daysOpen!,
                 legs: stillOpenLegs.map(leg => ({
                     right: leg.right, strike: leg.strike, expiration: leg.expiration,
-                    closeNet: leg.closeNet!, pnl: leg.pnl!, pctGain: leg.pctGain,
+                    closedAt: leg.closedAt!, closeNet: leg.closeNet!, pnl: leg.pnl!, pctGain: leg.pctGain,
                 })),
             };
             await writeJson(redis, finalizedKey(hash, trade.id), record, FINALIZED_TTL_SECONDS);

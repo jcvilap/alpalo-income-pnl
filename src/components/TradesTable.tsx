@@ -336,6 +336,10 @@ function legDetailRows(trade: StrategyTrade): StrategyTrade[] {
         ...trade,
         id: `${trade.id}-leg-${i}`,
         status: leg.openClose === 'CLOSE' ? 'closed' : 'open',
+        // This leg's own close date, not the parent trade's — a leg closed
+        // early has its own closedAt well before the position as a whole is
+        // done (see `Leg.closedAt`); a still-open leg has none.
+        closedAt: leg.closedAt,
         legs: [leg],
         strikes: [leg.strike],
         expirations: [leg.expiration],

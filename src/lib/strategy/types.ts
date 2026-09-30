@@ -44,6 +44,14 @@ export interface Leg {
     openNet?: number;
     /** This leg's own live mark-to-market close value, once quoted. STRANGLE legs only. */
     closeNet?: number;
+    /**
+     * ISO-8601 instant this specific leg was closed (by its own closing
+     * order, or by confirmed-worthless expiration) — independent of the
+     * parent trade's `closedAt`, which only reflects when the *whole*
+     * position finished. Set alongside `closeNet`/`pnl` whenever a leg
+     * closes; stays unset while `openClose === 'OPEN'`. STRANGLE legs only.
+     */
+    closedAt?: string;
     /** This leg's own P&L: realized (closeNet != null) or live estimate. STRANGLE legs only. */
     pnl?: number;
     /** True when `pnl` is a live mark-to-market estimate rather than realized cash. */

@@ -241,14 +241,14 @@ function daysAt(fromIso: string, expiration: string): number {
  * UI's per-leg detail row for closed strangles the same way `closeStrangleLeg`
  * does for independent leg closes.
  */
-function stampStrangleLegCloses(openLegs: Leg[], closeOrderLegs: Leg[], underlying: string): Leg[] {
+function stampStrangleLegCloses(openLegs: Leg[], closeOrderLegs: Leg[], underlying: string, closeOrderTime: string): Leg[] {
     return openLegs.map(leg => {
         const sig = legSignature(underlying, leg);
         const closingLeg = closeOrderLegs.find(l => legSignature(underlying, l) === sig);
         if (!closingLeg || leg.openNet == null) return leg;
         const closeNet = legNetAmount(closingLeg);
         const pnl = leg.openNet + closeNet;
-        return { ...leg, closeNet, pnl, pctGain: pctGain(pnl, leg.openNet) };
+        return { ...leg, openClose: 'CLOSE', closedAt: closeOrderTime, closeNet, pnl, pctGain: pctGain(pnl, leg.openNet) };
     });
 }
 
@@ -345,6 +345,7 @@ function closeStrangleLeg(
                 ...leg,
                 quantity: Math.sign(leg.quantity) * consumed,
                 openClose: 'CLOSE',
+                closedAt: order.time,
                 openNet: legOpenShare,
                 closeNet: legCloseShare,
                 pnl: legPnl,
@@ -392,7 +393,7 @@ function closeStrangleLeg(
     const pnl = openShareTotal + closeShare;
     const daysOpen = earliestOpenTime ? safeHoldDays(earliestOpenTime, order.time) : 0;
 
-    const thisClosedLeg: Leg = { ...closingLeg, openNet: openShareTotal, closeNet: closeShare, pnl, pctGain: pctGain(pnl, openShareTotal) };
+    const thisClosedLeg: Leg = { ...closingLeg, closedAt: order.time, openNet: openShareTotal, closeNet: closeShare, pnl, pctGain: pctGain(pnl, openShareTotal) };
     // Always both of the strangle's original legs: this close plus its
     // sibling leg (still open, or already closed independently), deduped by
     // signature in case FIFO spanned lots with overlapping legs. `siblingLegs`
@@ -560,7 +561,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                     ? scaleLegs(lot.openLegs, lot.totalContracts, consumed)
                     : lot.openLegs;
                 const liveLegs = lot.match.strategy === 'STRANGLE' && consumedOpenLegs
-                    ? stampStrangleLegCloses(consumedOpenLegs, match.order.legs, lot.match.order.underlying)
+                    ? stampStrangleLegCloses(consumedOpenLegs, match.order.legs, lot.match.order.underlying, match.order.time)
                     : lot.openLegs;
                 const shape = toTradeShape(lot.match, consumed, liveLegs, lot.closedLegs);
                 const pnl = openShare + closeShare;
