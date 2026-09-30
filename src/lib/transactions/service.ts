@@ -35,19 +35,23 @@ function quoteSymbolFor(underlying: string): string {
 }
 
 /**
- * Root symbols whose *standard* (monthly-cycle) series settle AM — against a
- * special opening quotation computed from constituent opening prices, not
- * the previous day's regular-session close `getPriceOnDate` returns. Their
- * weekly counterparts (SPXW, RUTW, NDXP, VIXW — all PM-settled, against the
- * actual close) are a different series and settle correctly against daily
- * close, so they're deliberately excluded from this set. Confirming
- * worthlessness for an AM-settled leg would need the special settlement
- * value, not the close — since that's not available here, these legs are
- * simply never auto-finalized (left `status: 'open'` rather than risking a
- * wrong $0 close from a close/settlement mismatch; see Codex's PR #10
- * review).
+ * Root symbols that settle AM — against a special opening quotation (SOQ)
+ * computed from constituent opening prices, not the previous day's
+ * regular-session close `getPriceOnDate` returns. Confirming worthlessness
+ * for an AM-settled leg would need that special settlement value, not the
+ * close — since that's not available here, these legs are simply never
+ * auto-finalized (left `status: 'open'` rather than risking a wrong $0
+ * close from a close/settlement mismatch; see Codex's PR #10 review).
+ *
+ * Most weekly counterparts (SPXW, RUTW, NDXP) are a genuinely different,
+ * PM-settled series and correctly settle against daily close, so they're
+ * excluded here. VIXW is the exception: CBOE's own product spec settles
+ * both VIX and VIXW against the same VRO special opening quotation — VIXW
+ * does NOT follow the SPXW pattern despite the naming similarity. See
+ * https://www.cboe.com/tradable_products/vix/vix_options/specifications
+ * ("The exercise-settlement value for VIX/VIXW options (Ticker: VRO)...").
  */
-const AM_SETTLED_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX']);
+const AM_SETTLED_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX', 'VIXW']);
 
 export interface TradesResult {
     strategies: StrategyId[];
