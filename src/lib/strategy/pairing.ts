@@ -430,14 +430,42 @@ function closeStrangleLeg(
 }
 
 /** Dedupe legs by right/strike/expiration, keeping the first occurrence. */
+/**
+ * Merge legs sharing the same (right, strike, expiration) signature into one
+ * — a multi-contract leg closed across several separate single-leg orders
+ * (e.g. 3 contracts closed on one day, the remaining 2 closed weeks later)
+ * produces one `closedLeg` entry per order in `lot.closedLegs`, all with the
+ * same signature. A plain dedupe that just keeps the first occurrence would
+ * silently drop every later slice's contracts and cash — this sums the
+ * cash-flow fields instead so the merged leg's totals reflect every slice,
+ * and `pctGain` is recomputed from the merged openNet/pnl rather than kept
+ * from whichever slice happened to survive. Non-cash-flow fields (right,
+ * strike, expiration, symbol) are taken from the first occurrence since
+ * they're identical across every slice by construction of the signature
+ * match itself. `closedAt` keeps the *latest* slice's date — that's when
+ * this leg was actually fully wound down.
+ */
 function dedupeLegsBySignature(underlying: string, legs: Leg[]): Leg[] {
-    const seen = new Set<string>();
-    const result: Leg[] = [];
+    const bySig = new Map<string, Leg[]>();
     for (const leg of legs) {
         const sig = legSignature(underlying, leg);
-        if (seen.has(sig)) continue;
-        seen.add(sig);
-        result.push(leg);
+        const group = bySig.get(sig);
+        if (group) group.push(leg);
+        else bySig.set(sig, [leg]);
+    }
+    const result: Leg[] = [];
+    for (const group of bySig.values()) {
+        if (group.length === 1) {
+            result.push(group[0]);
+            continue;
+        }
+        const quantity = group.reduce((s, l) => s + l.quantity, 0);
+        const openNet = group.reduce((s, l) => s + (l.openNet ?? 0), 0);
+        const closeNet = group.reduce((s, l) => s + (l.closeNet ?? 0), 0);
+        const pnl = group.reduce((s, l) => s + (l.pnl ?? 0), 0);
+        const closedAt = group.reduce((latest: string | undefined, l) =>
+            !l.closedAt ? latest : (!latest || l.closedAt > latest) ? l.closedAt : latest, undefined);
+        result.push({ ...group[0], quantity, openNet, closeNet, pnl, pctGain: pctGain(pnl, openNet), closedAt });
     }
     return result;
 }
