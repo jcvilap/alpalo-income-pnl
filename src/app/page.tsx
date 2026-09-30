@@ -71,6 +71,9 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
         const from = new Date(now.getTime() - SCHWAB_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
         return { from: toDateStr(from), to };
     }
+    if (preset === '1D') {
+        return { from: to, to };
+    }
     if (found?.days) {
         const from = new Date(now.getTime() - found.days * 24 * 60 * 60 * 1000);
         return { from: toDateStr(from), to };

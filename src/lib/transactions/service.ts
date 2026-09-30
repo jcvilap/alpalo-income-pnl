@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v23';
+const STRATEGY_VERSION = 'v24';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -33,6 +33,21 @@ const INDEX_QUOTE_SYMBOLS: Record<string, string> = {
 function quoteSymbolFor(underlying: string): string {
     return INDEX_QUOTE_SYMBOLS[underlying] ?? underlying;
 }
+
+/**
+ * Root symbols whose *standard* (monthly-cycle) series settle AM — against a
+ * special opening quotation computed from constituent opening prices, not
+ * the previous day's regular-session close `getPriceOnDate` returns. Their
+ * weekly counterparts (SPXW, RUTW, NDXP, VIXW — all PM-settled, against the
+ * actual close) are a different series and settle correctly against daily
+ * close, so they're deliberately excluded from this set. Confirming
+ * worthlessness for an AM-settled leg would need the special settlement
+ * value, not the close — since that's not available here, these legs are
+ * simply never auto-finalized (left `status: 'open'` rather than risking a
+ * wrong $0 close from a close/settlement mismatch; see Codex's PR #10
+ * review).
+ */
+const AM_SETTLED_ROOTS = new Set(['SPX', 'NDX', 'RUT', 'VIX']);
 
 export interface TradesResult {
     strategies: StrategyId[];
@@ -72,7 +87,7 @@ function parsedKey(strategies: StrategyId[], hash: string, from: string, to: str
  * `FinalizedTrade` for why this needs to exist at all.
  */
 function finalizedKey(hash: string, tradeId: string): string {
-    return `incomepnl:finalized:${hash}:${tradeId}`;
+    return `incomepnl:finalized:${STRATEGY_VERSION}:${hash}:${tradeId}`;
 }
 /** TTL for a durable finalization record — long enough to outlive Schwab's own ~1-year transaction lookback, since a trade older than that will never be re-fetched/re-evaluated anyway. */
 const FINALIZED_TTL_SECONDS = 400 * 24 * 60 * 60;
@@ -193,7 +208,15 @@ export async function getTrades(opts: {
         );
         for (let i = 0; i < stillOpen.length; i++) {
             const record = finalizedRecords[i];
-            if (!record) continue;
+            // A record confirmed closed after this request's own fetch
+            // horizon (opts.to) can't be applied here — this request only
+            // asked Schwab for transactions through opts.to, so surfacing a
+            // later close/realized P&L would show the user information a
+            // historical report at this horizon couldn't actually have
+            // known yet (e.g. a custom report ending before the expiration
+            // that later confirmed it worthless). Leave the trade as
+            // whatever buildTrades/live-quote logic already determined.
+            if (!record || record.closedAt > opts.to) continue;
             applyFinalizedRecord(stillOpen[i], record);
         }
 
@@ -477,6 +500,10 @@ async function applyUnrealizedPnl(
         let allExpiredWorthless = allExpiredWithinHorizonAndNoQuote && openLegCount > 0;
         if (allExpiredWorthless) {
             for (const leg of candidateWorthlessLegs) {
+                if (AM_SETTLED_ROOTS.has(leg.underlying)) {
+                    allExpiredWorthless = false;
+                    break;
+                }
                 const settlementPrice = await settlementPriceFor(leg.underlying, leg.expiration);
                 const confirmedWorthless = settlementPrice != null && (
                     leg.right === 'CALL' ? settlementPrice <= leg.strike : settlementPrice >= leg.strike
@@ -507,7 +534,14 @@ async function applyUnrealizedPnl(
         // close instead of leaving it looking perpetually "open".
         if (openLegCount > 0 && allExpiredWorthless && latestExpiration) {
             trade.status = 'closed';
-            trade.closedAt = latestExpiration;
+            // `closedAt` must be a full ISO instant, not a bare yyyy-mm-dd —
+            // `tradeInRange` compares it lexicographically against
+            // `opts.from`/`opts.to`, which are always full ISO instants
+            // (see the API route's `toIso`), and a bare date string sorts
+            // *before* any same-day ISO instant ("2026-09-04" < "2026-09-04T00:00:00.000Z"
+            // is false, since "" < "T..." lexicographically) — that would
+            // wrongly exclude a trade that finalized on the range's first day.
+            trade.closedAt = `${latestExpiration}T23:59:59.999Z`;
             // Promote openNet to the trade's *total* basis (both legs, not
             // just the still-open share) and closeNet to the sum of every
             // leg's actual close cash (the expired leg's $0 plus any
