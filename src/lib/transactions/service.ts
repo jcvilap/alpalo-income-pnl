@@ -63,6 +63,44 @@ function parsedKey(strategies: StrategyId[], hash: string, from: string, to: str
 }
 
 /**
+ * Key for a trade's *durable* finalization record — independent of the
+ * short-lived, date-range/strategy-scoped `parsedKey` cache. `trade.id` is
+ * deterministic from the underlying Schwab order (see `buildTrades` in
+ * pairing.ts: `open-${orderId}-${remainingContracts}`), so it's stable
+ * across any query combination that happens to include this trade, unlike
+ * `parsedKey` which changes per date range/strategy selection. See
+ * `FinalizedTrade` for why this needs to exist at all.
+ */
+function finalizedKey(hash: string, tradeId: string): string {
+    return `incomepnl:finalized:${hash}:${tradeId}`;
+}
+/** TTL for a durable finalization record — long enough to outlive Schwab's own ~1-year transaction lookback, since a trade older than that will never be re-fetched/re-evaluated anyway. */
+const FINALIZED_TTL_SECONDS = 400 * 24 * 60 * 60;
+
+/**
+ * The fields `applyUnrealizedPnl` computes once when it confirms a trade
+ * expired worthless — persisted independently of the parsed-trade query
+ * cache (see `finalizedKey`) so the decision survives that cache's 15-minute
+ * TTL and applies no matter which date-range/strategy combination later
+ * requests this same trade. Without this, `buildTrades` would reconstruct
+ * the trade as `status: 'open'` on the next cache miss and re-evaluate
+ * worthlessness against *that request's* live price — unsound, since a
+ * later price move back across the strike could flip an already-settled
+ * position's classification back and forth forever (see Codex's PR #10
+ * review).
+ */
+interface FinalizedTrade {
+    closedAt: string;
+    closeNet: number;
+    openNet: number;
+    pnl: number;
+    pctGain?: number;
+    daysOpen: number;
+    /** Per-leg finalized fields, matched back onto `trade.legs` by (right, strike, expiration) since leg array order isn't guaranteed stable. */
+    legs: { right: string; strike: number; expiration: string; closeNet: number; pnl: number; pctGain?: number }[];
+}
+
+/**
  * Widen `from` to Schwab's full ~1-year lookback ending at `to` (never
  * narrower than requested, and never wider than the API allows). A trade's
  * opening order can sit well before the user's visible window, so we always
@@ -141,18 +179,34 @@ export async function getTrades(opts: {
             await writeJson(redis, pKey, { strategies, range: { from: fetchFrom, to: opts.to }, trades: allTrades, cached: false, fetchedAt } as TradesResult, PARSED_TTL_SECONDS);
         }
 
+        // Apply any trade already durably confirmed expired-worthless in a
+        // *previous* request, no matter which date-range/strategy query
+        // produced `allTrades` this time — the parsed-trade cache above is
+        // scoped per query combination and only 15 minutes deep, so relying
+        // on it alone would let a trade re-appear as "open" (and get
+        // re-evaluated against a fresh, possibly different, live price) the
+        // moment a different filter combination or a cache expiry hits it.
+        // See `finalizedKey`/`FinalizedTrade`.
+        const stillOpen = allTrades.filter(t => t.status === 'open');
+        const finalizedRecords = await Promise.all(
+            stillOpen.map(t => readJson<FinalizedTrade>(redis, finalizedKey(hash, t.id))),
+        );
+        for (let i = 0; i < stillOpen.length; i++) {
+            const record = finalizedRecords[i];
+            if (!record) continue;
+            applyFinalizedRecord(stillOpen[i], record);
+        }
+
         // Mark-to-market open trades with live quotes on every request, whether
         // the underlying trade list came from cache or a fresh Schwab fetch.
         // A small subset of trades can also get permanently finalized here
         // (see `applyUnrealizedPnl`'s expired-worthless handling) — once a
-        // trade is confirmed closed that way, the decision must be written
-        // back to the parsed-trade cache so it becomes a durable fact rather
-        // than something re-derived from a fresh live quote on every future
-        // request. Re-deriving it live would be unsound: a leg's `itm` flag
-        // reflects *today's* price, not the price at its own expiration, so
-        // a later price move could otherwise flip an already-settled
-        // position's classification back and forth on every reparse.
-        const finalized = await applyUnrealizedPnl(allTrades, account, redis, opts.to);
+        // trade is confirmed closed that way, the decision is written to its
+        // own durable `finalizedKey` record (source of truth, checked above
+        // on every future request regardless of query params) and also back
+        // into this request's parsed-trade cache entry so the *current* view
+        // reflects it immediately without waiting for the next cache miss.
+        const finalized = await applyUnrealizedPnl(allTrades, account, redis, hash, opts.to);
         if (finalized) {
             await writeJson(redis, pKey, { strategies, range: { from: fetchFrom, to: opts.to }, trades: allTrades, cached: false, fetchedAt } as TradesResult, PARSED_TTL_SECONDS);
         }
@@ -182,6 +236,38 @@ export async function getTrades(opts: {
 }
 
 /**
+ * Apply a previously-persisted `FinalizedTrade` record onto a freshly
+ * rebuilt trade (still `status: 'open'` because `buildTrades` has no memory
+ * of prior finalizations — see `finalizedKey`). Matches each finalized leg
+ * back onto `trade.legs` by (right, strike, expiration) rather than array
+ * index, since leg order isn't guaranteed stable across rebuilds.
+ */
+function applyFinalizedRecord(trade: StrategyTrade, record: FinalizedTrade): void {
+    trade.status = 'closed';
+    trade.closedAt = record.closedAt;
+    trade.closeNet = record.closeNet;
+    trade.openNet = record.openNet;
+    trade.pnl = record.pnl;
+    trade.pctGain = record.pctGain;
+    trade.daysOpen = record.daysOpen;
+    trade.pnlIsEstimate = false;
+    trade.underlyingPrice = undefined;
+    for (const leg of trade.legs) {
+        if (leg.openClose === 'CLOSE') continue;
+        const finalizedLeg = record.legs.find(
+            l => l.right === leg.right && l.strike === leg.strike && l.expiration === leg.expiration,
+        );
+        if (!finalizedLeg) continue;
+        leg.openClose = 'CLOSE';
+        leg.closeNet = finalizedLeg.closeNet;
+        leg.pnl = finalizedLeg.pnl;
+        leg.pctGain = finalizedLeg.pctGain;
+        leg.pnlIsEstimate = false;
+        leg.itm = undefined;
+    }
+}
+
+/**
  * Mark-to-market open trades in place using live option quotes.
  *
  * Unrealized P&L = openNet + cash from closing every open leg at its current mark.
@@ -195,6 +281,8 @@ async function applyUnrealizedPnl(
     trades: StrategyTrade[],
     account: AccountConfig,
     redis: RedisClientType,
+    /** Cache-key namespace for this account, used to write a finalized trade's durable record (see `finalizedKey`). */
+    hash: string,
     /**
      * The raw-transaction fetch's own horizon (`opts.to` from `getTrades`) —
      * the last date we actually asked Schwab for closing transactions. A
@@ -251,6 +339,24 @@ async function applyUnrealizedPnl(
 
     const OPTION_MULTIPLIER = 100;
     const now = new Date().toISOString();
+    // Dedupes historical-price lookups across trades/legs that share the
+    // same underlying+expiration (e.g. two strangles on the same symbol
+    // expiring the same day) — Schwab's price-history endpoint is a
+    // separate network call per (symbol, date) pair, not part of the
+    // `getQuotes` batch above.
+    const settlementPriceCache = new Map<string, Promise<number | null>>();
+    const settlementPriceFor = (underlying: string, expiration: string): Promise<number | null> => {
+        const key = `${underlying}:${expiration}`;
+        let pending = settlementPriceCache.get(key);
+        if (!pending) {
+            pending = client.getPriceOnDate(quoteSymbolFor(underlying), expiration).catch(e => {
+                console.warn(`Failed to fetch settlement price for ${key}:`, e);
+                return null;
+            });
+            settlementPriceCache.set(key, pending);
+        }
+        return pending;
+    };
     for (const trade of openTrades) {
         let closeValue = 0;
         let missingQuote = false;
@@ -270,9 +376,17 @@ async function applyUnrealizedPnl(
         // `stillOpenLegs` collects the actual Leg objects so they can be
         // finalized (flipped to CLOSE) in place once the trade itself is.
         let openLegCount = 0;
-        let allExpiredWorthless = true;
+        let allExpiredWithinHorizonAndNoQuote = true;
         let latestExpiration: string | null = null;
         const stillOpenLegs: typeof trade.legs = [];
+        // Legs eligible for finalization pending a settlement-price check
+        // (see after this loop) — expired, no live quote, within the
+        // fetched horizon. `leg.itm` is deliberately NOT used to decide this
+        // (it reflects *today's* price for the ITM badge elsewhere in the
+        // UI, not the price at the leg's own expiration — using it here
+        // previously let a later price move flip an already-settled
+        // position's classification; see Codex's PR #10 review).
+        const candidateWorthlessLegs: typeof trade.legs = [];
         for (const leg of trade.legs) {
             if (leg.openClose === 'CLOSE') {
                 if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
@@ -320,21 +434,22 @@ async function applyUnrealizedPnl(
             openLegCount++;
             stillOpenLegs.push(leg);
             if (!latestExpiration || leg.expiration > latestExpiration) latestExpiration = leg.expiration;
-            // Confirmed worthless requires: expired (no longer tradeable),
-            // known to be OTM (leg.itm === false, not just undefined — an
-            // ITM leg settles via assignment/exercise for real value, so
-            // treating it as a $0 close would be wrong), AND within the
-            // horizon we actually fetched closing transactions through
-            // (`fetchHorizon` — a custom report ending in the past hasn't
-            // looked far enough ahead to rule out a real close existing
-            // after it, so "no closing transaction found" isn't a safe
-            // conclusion past that point; see Codex's PR #9 review). A leg
-            // still priced by a live quote despite being past expiration
-            // (e.g. same-day expiry still settling) isn't "confirmed
-            // worthless" either — its mark is the real closing value, not a
-            // synthesized $0.
+            // Finalization-eligible requires: expired (no longer
+            // tradeable), no live quote (Schwab's own signal that it's done
+            // trading), and within the horizon we actually fetched closing
+            // transactions through (`fetchHorizon` — a custom report ending
+            // in the past hasn't looked far enough ahead to rule out a real
+            // close existing after it, so "no closing transaction found"
+            // isn't a safe conclusion past that point; see Codex's PR #9
+            // review). Whether it's actually *worthless* is checked after
+            // this loop using the settlement price at expiration, not
+            // today's price — see `candidateWorthlessLegs` below.
             const expiredWithinFetchedHorizon = expired && leg.expiration <= fetchHorizon;
-            if (!(expiredWithinFetchedHorizon && !hasQuote && leg.itm === false)) allExpiredWorthless = false;
+            if (expiredWithinFetchedHorizon && !hasQuote) {
+                candidateWorthlessLegs.push(leg);
+            } else {
+                allExpiredWithinHorizonAndNoQuote = false;
+            }
 
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just
@@ -349,6 +464,29 @@ async function applyUnrealizedPnl(
             }
         }
         if (missingQuote) continue;
+
+        // Confirm worthlessness using the settlement price at each
+        // candidate leg's own expiration date, not today's — the whole
+        // point of checking is that today's price can be on either side of
+        // the strike regardless of where it was on the day the option
+        // actually stopped trading. A candidate leg is worthless only when
+        // the historical price is known and lands strictly on the losing
+        // side of the strike for whoever is long it; a missing/ambiguous
+        // history (e.g. a de-listed or halted symbol) leaves the trade open
+        // rather than guessing.
+        let allExpiredWorthless = allExpiredWithinHorizonAndNoQuote && openLegCount > 0;
+        if (allExpiredWorthless) {
+            for (const leg of candidateWorthlessLegs) {
+                const settlementPrice = await settlementPriceFor(leg.underlying, leg.expiration);
+                const confirmedWorthless = settlementPrice != null && (
+                    leg.right === 'CALL' ? settlementPrice <= leg.strike : settlementPrice >= leg.strike
+                );
+                if (!confirmedWorthless) {
+                    allExpiredWorthless = false;
+                    break;
+                }
+            }
+        }
 
         // Whole-trade P&L = live mark-to-market of the still-open leg(s) plus
         // any already-locked-in P&L from a leg closed independently earlier —
@@ -400,7 +538,28 @@ async function applyUnrealizedPnl(
             // against (see the Range column's `status === 'closed'` guard
             // in TradesTable.tsx).
             trade.underlyingPrice = undefined;
+            // This trade's `pnlIsEstimate` could already be `true` from a
+            // previous request's cache write (this same parsed-trade list
+            // gets rewritten whenever *any* trade in it finalizes, not just
+            // this one) — clear it explicitly rather than leaving whatever
+            // was already there, since the P&L is now realized, not a live
+            // mark-to-market estimate (see Codex's PR #10 review).
+            trade.pnlIsEstimate = false;
             anyFinalized = true;
+
+            const record: FinalizedTrade = {
+                closedAt: trade.closedAt,
+                closeNet: trade.closeNet,
+                openNet: trade.openNet,
+                pnl: trade.pnl!,
+                pctGain: trade.pctGain,
+                daysOpen: trade.daysOpen!,
+                legs: stillOpenLegs.map(leg => ({
+                    right: leg.right, strike: leg.strike, expiration: leg.expiration,
+                    closeNet: leg.closeNet!, pnl: leg.pnl!, pctGain: leg.pctGain,
+                })),
+            };
+            await writeJson(redis, finalizedKey(hash, trade.id), record, FINALIZED_TTL_SECONDS);
         } else {
             trade.pnlIsEstimate = true;
         }

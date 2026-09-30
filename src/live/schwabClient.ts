@@ -608,6 +608,45 @@ export class SchwabClient {
         return result;
     }
 
+    /**
+     * Get a symbol's daily closing price on a specific historical date — used
+     * to confirm whether an option expired genuinely in- or out-of-the-money
+     * (a live quote only reflects *today's* price, which can drift across a
+     * strike well after expiration and give a wrong answer; see
+     * transactions/service.ts's expired-worthless finalization). Returns
+     * `null` if Schwab has no candle for that date (e.g. a weekend/holiday,
+     * or a date outside its history retention).
+     */
+    async getPriceOnDate(symbol: string, dateIso: string): Promise<number | null> {
+        // Schwab's daily-candle history is keyed by calendar day, not time of
+        // day — request a tight [date, date+1] window so exactly one candle
+        // (or none) comes back, rather than parsing a wider range and
+        // picking one out.
+        const start = new Date(`${dateIso.slice(0, 10)}T00:00:00.000Z`);
+        const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+
+        // Schwab's pricehistory endpoint only allows frequencyType: 'minute'
+        // when periodType is 'day' — daily candles require periodType
+        // 'month' (or 'year'/'ytd') paired with frequencyType 'daily'.
+        const raw = await this.request<{ candles?: { datetime: number; close: number }[] }>(
+            'GET', `${MARKETDATA_BASE}/pricehistory`, {
+                params: {
+                    symbol,
+                    periodType: 'month',
+                    period: '1',
+                    frequencyType: 'daily',
+                    frequency: '1',
+                    startDate: String(start.getTime()),
+                    endDate: String(end.getTime()),
+                    needExtendedHoursData: 'false',
+                }
+            }
+        );
+
+        const candle = raw.candles?.[0];
+        return candle ? candle.close : null;
+    }
+
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
