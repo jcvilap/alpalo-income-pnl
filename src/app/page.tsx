@@ -133,8 +133,17 @@ function HomeContent() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
+    // Guards against out-of-order responses: a menu-close and a range-preset
+    // click can each fire their own `load()` for the same render (the menu's
+    // outside-click `mousedown` fires before the preset button's `onClick`),
+    // and with no sequencing the slower request's stale result could
+    // overwrite the newer one. Each call stamps its own token; only the
+    // still-latest call is allowed to commit its result.
+    const loadRequestRef = useRef(0);
+
     const load = useCallback(
         async (refresh = false, overrideFrom?: string, overrideTo?: string, overrideStrategies?: string[]) => {
+            const requestId = ++loadRequestRef.current;
             setLoading(true);
             setError(null);
             try {
@@ -147,12 +156,14 @@ function HomeContent() {
                 const res = await fetch(`/api/trades?${params.toString()}`);
                 const json = await res.json();
                 if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+                if (requestId !== loadRequestRef.current) return;
                 setData(json);
             } catch (e) {
+                if (requestId !== loadRequestRef.current) return;
                 setError(e instanceof Error ? e.message : String(e));
                 setData(null);
             } finally {
-                setLoading(false);
+                if (requestId === loadRequestRef.current) setLoading(false);
             }
         },
         [from, to, strategies],
