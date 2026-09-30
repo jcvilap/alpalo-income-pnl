@@ -375,6 +375,18 @@ function closeStrangleLeg(
 
     if (!firstLot) return null;
 
+    // If the lot still has an open leg after this close, don't also emit a
+    // standalone trade for it — the closed leg's locked-in data already
+    // lives on `lot.closedLegs` (set above) and flows into the lot's own
+    // eventual trade record (still open, or later finalized once the
+    // sibling also closes) via `toTradeShape`'s `closedLegs` param. A
+    // strangle is exactly one row with exactly two legs, one closed one
+    // open, until both are closed — not two separate rows duplicating the
+    // same position (see AGENTS.md-worthy note: this used to emit both,
+    // which produced mismatched timelines/expand arrows across the two
+    // records once the still-open leg later finalized independently).
+    if (hasOpenSibling) return null;
+
     const consumedContracts = totalCloseContracts - remainingToClose;
     const closeShare = (consumedContracts / totalCloseContracts) * order.netAmount;
     const pnl = openShareTotal + closeShare;
