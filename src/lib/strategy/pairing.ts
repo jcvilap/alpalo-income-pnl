@@ -600,11 +600,52 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
         }
     }
 
-    // Any remaining open lots are still-open trades (using their remaining share of open net).
+    // Any remaining open lots are still-open trades (using their remaining share of open net) —
+    // unless every leg still open has already passed its expiration with no closing order ever
+    // seen for it (e.g. it expired worthless out-of-the-money and Schwab never generated an
+    // assignment/exercise transaction). That leg is not tradeable anymore and never will be, so
+    // showing the lot as still "open" is actively misleading — flip it to closed, valuing the
+    // expired leg(s) at $0 the same way `applyUnrealizedPnl` in transactions/service.ts does for
+    // live mark-to-market. A lot with a mix of expired and still-live legs (e.g. a double
+    // calendar's near leg expired but its far leg hasn't) stays open — only *all* legs expired
+    // means the position is truly done.
+    const nowIso = new Date().toISOString();
     for (const q of openQueues.values()) {
         for (const lot of q) {
             const openShare = lot.remainingOpenNet ?? (lot.remainingContracts / lot.totalContracts) * lot.match.order.netAmount;
             const shape = toTradeShape(lot.match, lot.remainingContracts, lot.openLegs, lot.closedLegs);
+            const stillOpenLegs = shape.legs.filter(l => l.openClose === 'OPEN');
+            // Use the raw (unfloored) day difference here, not `daysAt` —
+            // that helper floors at 0 for *display* ("days left" can't go
+            // negative), which would make "expires today" indistinguishable
+            // from "expired 26 days ago". Only a strictly negative diff
+            // means the expiration date itself has fully passed.
+            const allExpired = stillOpenLegs.length > 0 && stillOpenLegs.every(l => {
+                try {
+                    return differenceInCalendarDays(parseISO(l.expiration), parseISO(nowIso)) < 0;
+                } catch {
+                    return false;
+                }
+            });
+            if (allExpired) {
+                trades.push({
+                    id: `open-${lot.match.order.orderId}-${lot.remainingContracts}`,
+                    strategy: lot.match.strategy,
+                    underlying: lot.match.order.underlying,
+                    status: 'closed',
+                    openOrderId: lot.match.order.orderId,
+                    openedAt: lot.match.order.time,
+                    openFillTimes: lot.openFillTimes,
+                    openNet: openShare,
+                    closedAt: stillOpenLegs.reduce((latest, l) => (l.expiration > latest ? l.expiration : latest), stillOpenLegs[0].expiration),
+                    closeNet: 0,
+                    pnl: openShare,
+                    pctGain: pctGain(openShare, openShare),
+                    daysOpen: safeHoldDays(lot.match.order.time, nowIso),
+                    ...shape,
+                });
+                continue;
+            }
             trades.push({
                 id: `open-${lot.match.order.orderId}-${lot.remainingContracts}`,
                 strategy: lot.match.strategy,
@@ -614,7 +655,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 openedAt: lot.match.order.time,
                 openFillTimes: lot.openFillTimes,
                 openNet: openShare,
-                daysOpen: safeHoldDays(lot.match.order.time, new Date().toISOString()),
+                daysOpen: safeHoldDays(lot.match.order.time, nowIso),
                 ...shape,
             });
         }
