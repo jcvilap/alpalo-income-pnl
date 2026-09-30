@@ -389,11 +389,15 @@ function closeStrangleLeg(
         const totalCloseNet = closeShare + siblingCloseNet;
         const totalPnl = pnl + siblingClosedLegs.reduce((s, l) => s + (l.pnl ?? 0), 0);
 
-        // `lot.closedLegs` holds the actual leg objects other code paths
-        // (e.g. a still-open sibling trade, before this lot completed) may
-        // also reference — shallow-copy before handing them to this
-        // historical record so a later mutation elsewhere can't bleed in.
-        const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...(lot.closedLegs ?? []).map(l => ({ ...l }))]);
+        // `siblingClosedLegs` already excludes `closedLeg` itself (see
+        // above) — reuse it here rather than `lot.closedLegs` directly, or
+        // this leg's own quantity/cash/P&L would be summed twice by the
+        // merge-by-signature dedupe below (once as `thisClosedLeg`, once
+        // again as its own still-present entry in `lot.closedLegs`; see
+        // Codex's PR #10 review). The remaining entries are shallow-copied
+        // since they're live objects other code paths (e.g. a still-open
+        // sibling trade, before this lot completed) may also reference.
+        const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...siblingClosedLegs.map(l => ({ ...l }))]);
         const strikes = distinctSorted(allLegs.map(l => l.strike));
         const expirations = distinctSorted(allLegs.map(l => l.expiration));
         const openedAt = lot.match.order.time;
