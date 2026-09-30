@@ -383,8 +383,15 @@ function closeStrangleLeg(
     const thisClosedLeg: Leg = { ...closingLeg, openNet: openShareTotal, closeNet: closeShare, pnl, pctGain: pctGain(pnl, openShareTotal) };
     // Always both of the strangle's original legs: this close plus its
     // sibling leg (still open, or already closed independently), deduped by
-    // signature in case FIFO spanned lots with overlapping legs.
-    const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...siblingLegs]);
+    // signature in case FIFO spanned lots with overlapping legs. `siblingLegs`
+    // holds live references into `lot.openLegs`/`lot.closedLegs` — the same
+    // objects the still-open sibling trade keeps mutating (e.g. when it
+    // later finalizes an expired leg, see `applyUnrealizedPnl` in
+    // transactions/service.ts) — so this standalone historical record must
+    // shallow-copy them, or a mutation made for the *other* trade's context
+    // (a different closedAt/timeline) would silently bleed into this one's
+    // display too.
+    const allLegs = dedupeLegsBySignature(order.underlying, [thisClosedLeg, ...siblingLegs.map(l => ({ ...l }))]);
     const strikes = distinctSorted(allLegs.map(l => l.strike));
     const expirations = distinctSorted(allLegs.map(l => l.expiration));
 

@@ -37,6 +37,7 @@ const STRATEGIES = [
 ];
 
 const RANGE_PRESETS = [
+    { id: '1D', label: '1D', days: 1 },
     { id: '1W', label: '1W', days: 7 },
     { id: '1M', label: '1M', days: 30 },
     { id: '2M', label: '2M', days: 60 },

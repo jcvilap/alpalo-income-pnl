@@ -69,9 +69,18 @@ function orderByPinning<T extends { column: { getIsPinned: () => 'left' | 'right
 
 const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations', 'range']);
 
-/** True for trades that can show a per-leg breakdown row: strangles only (open or closed). */
+/**
+ * True for trades that can show a per-leg breakdown row: strangles only,
+ * excluding the standalone "one leg closed independently" record (id prefix
+ * `strangle-leg-close-` — see `closeStrangleLeg` in pairing.ts). That record
+ * already *is* a single closed leg's own complete history; its `legs` array
+ * only carries the sibling leg along for display context (original strikes),
+ * not as a second live-tracked leg on the same timeline — expanding it would
+ * show both legs under this record's own closedAt/daysOpen, which only ever
+ * describes the leg that was actually closed here.
+ */
 function hasLegDetail(trade: StrategyTrade): boolean {
-    return trade.strategy === 'STRANGLE';
+    return trade.strategy === 'STRANGLE' && !trade.id.startsWith('strangle-leg-close-');
 }
 
 /**
