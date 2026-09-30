@@ -143,7 +143,16 @@ function clampLookback(to: string): string {
 function tradeInRange(trade: StrategyTrade, from: string, to: string): boolean {
     const openTimes = trade.openFillTimes && trade.openFillTimes.length > 0 ? trade.openFillTimes : [trade.openedAt];
     const closed = trade.closedAt ?? trade.openedAt;
-    return openTimes.some(opened => opened >= from && opened <= to) || (closed >= from && closed <= to);
+    if (openTimes.some(opened => opened >= from && opened <= to) || (closed >= from && closed <= to)) return true;
+    // A strangle opened before `from` with one leg closed independently
+    // inside the range, while its sibling stays open, has real portfolio
+    // activity in this window even though the trade's own openedAt/closedAt
+    // both fall outside it (closedAt is unset — the position as a whole
+    // isn't done yet). Closing that leg no longer emits its own separate
+    // row (see pairing.ts's closeStrangleLeg — one strangle is always one
+    // row, not two), so without this check that activity would silently
+    // vanish from a historical report scoped to this range entirely.
+    return trade.legs.some(l => l.closedAt != null && l.closedAt >= from && l.closedAt <= to);
 }
 
 /**
