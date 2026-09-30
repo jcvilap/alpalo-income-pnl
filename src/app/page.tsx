@@ -37,6 +37,7 @@ const STRATEGIES = [
 ];
 
 const RANGE_PRESETS = [
+    { id: '1D', label: '1D', days: 1 },
     { id: '1W', label: '1W', days: 7 },
     { id: '1M', label: '1M', days: 30 },
     { id: '2M', label: '2M', days: 60 },
@@ -69,6 +70,9 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
     if (preset === 'ALL') {
         const from = new Date(now.getTime() - SCHWAB_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
         return { from: toDateStr(from), to };
+    }
+    if (preset === '1D') {
+        return { from: to, to };
     }
     if (found?.days) {
         const from = new Date(now.getTime() - found.days * 24 * 60 * 60 * 1000);
