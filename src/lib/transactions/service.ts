@@ -143,7 +143,19 @@ export async function getTrades(opts: {
 
         // Mark-to-market open trades with live quotes on every request, whether
         // the underlying trade list came from cache or a fresh Schwab fetch.
-        await applyUnrealizedPnl(allTrades, account, redis);
+        // A small subset of trades can also get permanently finalized here
+        // (see `applyUnrealizedPnl`'s expired-worthless handling) — once a
+        // trade is confirmed closed that way, the decision must be written
+        // back to the parsed-trade cache so it becomes a durable fact rather
+        // than something re-derived from a fresh live quote on every future
+        // request. Re-deriving it live would be unsound: a leg's `itm` flag
+        // reflects *today's* price, not the price at its own expiration, so
+        // a later price move could otherwise flip an already-settled
+        // position's classification back and forth on every reparse.
+        const finalized = await applyUnrealizedPnl(allTrades, account, redis);
+        if (finalized) {
+            await writeJson(redis, pKey, { strategies, range: { from: fetchFrom, to: opts.to }, trades: allTrades, cached: false, fetchedAt } as TradesResult, PARSED_TTL_SECONDS);
+        }
 
         // Remaining DTE depends on "now", not the cached trade's open time, so
         // it's recomputed fresh on every request regardless of cache status.
@@ -183,9 +195,10 @@ async function applyUnrealizedPnl(
     trades: StrategyTrade[],
     account: AccountConfig,
     redis: RedisClientType,
-): Promise<void> {
+): Promise<boolean> {
+    let anyFinalized = false;
     const openTrades = trades.filter(t => t.status === 'open');
-    if (openTrades.length === 0) return;
+    if (openTrades.length === 0) return anyFinalized;
 
     const optionSymbols = Array.from(
         new Set(
@@ -200,7 +213,7 @@ async function applyUnrealizedPnl(
         new Set(openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => quoteSymbolFor(l.underlying)))),
     );
     const symbols = Array.from(new Set([...optionSymbols, ...underlyingSymbols]));
-    if (symbols.length === 0) return;
+    if (symbols.length === 0) return anyFinalized;
 
     const client = new SchwabClient({
         name: account.name,
@@ -221,7 +234,7 @@ async function applyUnrealizedPnl(
         quotes = await client.getQuotes(symbols);
     } catch (e) {
         console.warn('Failed to fetch live quotes for unrealized P&L:', e);
-        return;
+        return anyFinalized;
     }
 
     const OPTION_MULTIPLIER = 100;
@@ -235,18 +248,23 @@ async function applyUnrealizedPnl(
         // but their locked-in P&L still has to count toward the whole trade's
         // total below (realizedLegPnl), not just the still-open leg's live mark.
         let realizedLegPnl = 0;
+        let realizedLegCloseNet = 0;
         // Tracks whether every still-open leg has both expired *and* been
         // confirmed out-of-the-money (not just expired — an ITM leg would
         // have settled via assignment/exercise for real value, not $0) — see
         // the status-flip check after this loop. `openLegCount` guards
         // against flipping a trade with zero still-open legs (shouldn't
         // happen, but a wrongly-empty `legs` shouldn't silently look "done").
+        // `stillOpenLegs` collects the actual Leg objects so they can be
+        // finalized (flipped to CLOSE) in place once the trade itself is.
         let openLegCount = 0;
         let allExpiredWorthless = true;
         let latestExpiration: string | null = null;
+        const stillOpenLegs: typeof trade.legs = [];
         for (const leg of trade.legs) {
             if (leg.openClose === 'CLOSE') {
                 if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
+                if (trade.strategy === 'STRANGLE' && leg.closeNet != null) realizedLegCloseNet += leg.closeNet;
                 continue;
             }
             // ITM only needs the underlying's own price, not the option's
@@ -288,6 +306,7 @@ async function applyUnrealizedPnl(
             closeValue += leg.quantity * mark * OPTION_MULTIPLIER;
 
             openLegCount++;
+            stillOpenLegs.push(leg);
             if (!latestExpiration || leg.expiration > latestExpiration) latestExpiration = leg.expiration;
             // Confirmed worthless requires both: expired (no longer
             // tradeable) AND known to be OTM (leg.itm === false, not just
@@ -329,21 +348,39 @@ async function applyUnrealizedPnl(
         // loop above) means the position is genuinely done — Schwab just
         // never generated an explicit closing transaction for the worthless
         // expiration. Flip it to closed with a real (not estimated) $0
-        // close instead of leaving it looking perpetually "open". `daysOpen`
-        // uses the latest leg expiration, not wall-clock "now" — otherwise
-        // an already-finished trade's holding period would keep growing
-        // every day it's reparsed. A trade with zero still-open legs is left
-        // untouched (shouldn't happen for a `status: 'open'` trade, but
-        // isn't grounds to synthesize a close either).
+        // close instead of leaving it looking perpetually "open".
         if (openLegCount > 0 && allExpiredWorthless && latestExpiration) {
             trade.status = 'closed';
             trade.closedAt = latestExpiration;
-            trade.closeNet = 0;
+            // Promote openNet to the trade's *total* basis (both legs, not
+            // just the still-open share) and closeNet to the sum of every
+            // leg's actual close cash (the expired leg's $0 plus any
+            // already-realized sibling close), so `openNet + closeNet ===
+            // pnl` holds for this now-completed trade the same way it does
+            // for any other closed trade in the table.
+            trade.openNet = totalOpenNet;
+            trade.closeNet = realizedLegCloseNet;
+            // `daysOpen` uses the latest leg expiration, not wall-clock
+            // "now" — otherwise an already-finished trade's holding period
+            // would keep growing every day it's reparsed.
             trade.daysOpen = safeHoldDays(trade.openedAt, latestExpiration);
+            // Finalize the still-open leg objects too — otherwise expanding
+            // this now-closed trade's per-leg detail row would still show
+            // them as "open" with an estimate marker (`legDetailRows` in
+            // TradesTable.tsx reads these fields directly off the leg).
+            for (const leg of stillOpenLegs) {
+                leg.openClose = 'CLOSE';
+                leg.closeNet = 0;
+                leg.pnl = leg.openNet ?? 0;
+                leg.pnlIsEstimate = false;
+                leg.pctGain = leg.openNet && leg.openNet !== 0 ? (leg.pnl / Math.abs(leg.openNet)) * 100 : undefined;
+            }
+            anyFinalized = true;
         } else {
             trade.pnlIsEstimate = true;
         }
     }
+    return anyFinalized;
 }
 
 /**
