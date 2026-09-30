@@ -394,6 +394,21 @@ function closeStrangleLeg(
     const daysOpen = earliestOpenTime ? safeHoldDays(earliestOpenTime, order.time) : 0;
 
     const thisClosedLeg: Leg = { ...closingLeg, closedAt: order.time, openNet: openShareTotal, closeNet: closeShare, pnl, pctGain: pctGain(pnl, openShareTotal) };
+
+    // If a sibling leg already closed independently *before* this order (a
+    // separate single-leg close, not this same close order), its realized
+    // cash lives only in `siblingLegs`/`lot.closedLegs` — `openShareTotal`/
+    // `closeShare`/`pnl` above only ever tracked *this* close's own leg.
+    // Without folding it in here, the whole trade's totals (and therefore
+    // aggregate metrics) would silently drop that leg's entire realized
+    // P&L once this close finishes the lot and it's never touched again
+    // (see Codex's PR #10 review).
+    const alreadyClosedSiblings = siblingLegs.filter(l => l.openClose === 'CLOSE');
+    const siblingOpenNet = alreadyClosedSiblings.reduce((s, l) => s + (l.openNet ?? 0), 0);
+    const siblingCloseNet = alreadyClosedSiblings.reduce((s, l) => s + (l.closeNet ?? 0), 0);
+    const totalOpenNet = openShareTotal + siblingOpenNet;
+    const totalCloseNet = closeShare + siblingCloseNet;
+    const totalPnl = pnl + alreadyClosedSiblings.reduce((s, l) => s + (l.pnl ?? 0), 0);
     // Always both of the strangle's original legs: this close plus its
     // sibling leg (still open, or already closed independently), deduped by
     // signature in case FIFO spanned lots with overlapping legs. `siblingLegs`
@@ -416,12 +431,12 @@ function closeStrangleLeg(
         status: 'closed',
         openOrderId: firstLot.match.order.orderId,
         openedAt,
-        openNet: openShareTotal,
+        openNet: totalOpenNet,
         closeOrderId: order.orderId,
         closedAt: order.time,
-        closeNet: closeShare,
-        pnl,
-        pctGain: pctGain(pnl, openShareTotal),
+        closeNet: totalCloseNet,
+        pnl: totalPnl,
+        pctGain: pctGain(totalPnl, totalOpenNet),
         daysOpen,
         excludeFromMetrics: hasOpenSibling,
         legs: allLegs,
