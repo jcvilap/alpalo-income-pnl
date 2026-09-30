@@ -163,6 +163,40 @@ function HomeContent() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    // While the strategy dropdown is open, checkbox clicks only update local
+    // draft state — the fetch is deferred until the dropdown closes (blur or
+    // outside click) so rapid multi-select toggling doesn't fire a fetch per
+    // click, which was producing a confusing lag as stale results kept
+    // arriving out of order.
+    const strategiesRef = useRef(strategies);
+    strategiesRef.current = strategies;
+
+    const toggleStrategy = useCallback((id: string) => {
+        setStrategies((prev) => {
+            const next = prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id];
+            return next.length > 0 ? next : prev;
+        });
+    }, []);
+
+    // "Select all" toggles every enabled strategy at once: selects all when
+    // not everything is already selected, otherwise clears back down to just
+    // the first one (toggleStrategy already refuses to empty the selection
+    // entirely, so mirror that floor here instead of landing on zero).
+    const toggleAllStrategies = useCallback(() => {
+        const enabledIds = STRATEGIES.filter((s) => s.enabled).map((s) => s.id);
+        setStrategies((prev) => {
+            const allSelected = enabledIds.every((id) => prev.includes(id));
+            return allSelected ? enabledIds.slice(0, 1) : enabledIds;
+        });
+    }, []);
+
+    const closeStrategyMenu = useCallback(() => {
+        setStrategyMenuOpen((wasOpen) => {
+            if (wasOpen) void load(false, from, to, strategiesRef.current);
+            return false;
+        });
+    }, [load, from, to]);
+
     // Keep the URL deep-linkable: reflect the current strategy/range/toggle
     // selection in the query string (replace, not push, so filter changes
     // don't pile up browser-history entries).
@@ -183,12 +217,12 @@ function HomeContent() {
         if (!strategyMenuOpen) return;
         const onClickOutside = (e: MouseEvent) => {
             if (strategyMenuRef.current && !strategyMenuRef.current.contains(e.target as Node)) {
-                setStrategyMenuOpen(false);
+                closeStrategyMenu();
             }
         };
         document.addEventListener('mousedown', onClickOutside);
         return () => document.removeEventListener('mousedown', onClickOutside);
-    }, [strategyMenuOpen]);
+    }, [strategyMenuOpen, closeStrategyMenu]);
 
     const selectPreset = useCallback(
         (id: RangePresetId) => {
@@ -201,18 +235,6 @@ function HomeContent() {
             }
         },
         [load, strategies],
-    );
-
-    const toggleStrategy = useCallback(
-        (id: string) => {
-            setStrategies((prev) => {
-                const next = prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id];
-                const applied = next.length > 0 ? next : prev;
-                void load(false, from, to, applied);
-                return applied;
-            });
-        },
-        [load, from, to],
     );
 
     // Recompute client-side rather than trusting `data.metrics` verbatim, so
@@ -236,6 +258,21 @@ function HomeContent() {
             className="min-h-screen px-4 py-6 sm:px-8 sm:py-10 transition-theme"
             style={{ background: 'var(--color-background)' }}
         >
+            {loading && (
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
+                    style={{ background: 'color-mix(in srgb, var(--color-background) 55%, transparent)' }}
+                >
+                    <div
+                        className="rounded-full animate-spin"
+                        style={{
+                            width: 40, height: 40,
+                            border: '3px solid var(--color-border)',
+                            borderTopColor: 'var(--color-primary)',
+                        }}
+                    />
+                </div>
+            )}
             <div className="max-w-6xl mx-auto flex flex-col gap-6">
                 {/* Header */}
                 <header className="flex items-start justify-between gap-4 flex-wrap">
@@ -260,7 +297,7 @@ function HomeContent() {
                         <div className="relative" ref={strategyMenuRef}>
                             <button
                                 type="button"
-                                onClick={() => setStrategyMenuOpen((v) => !v)}
+                                onClick={() => (strategyMenuOpen ? closeStrategyMenu() : setStrategyMenuOpen(true))}
                                 className="rounded-lg px-3 text-sm bg-surface h-9 flex items-center gap-2 min-w-[160px] justify-between"
                                 style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                             >
@@ -272,6 +309,21 @@ function HomeContent() {
                                     className="absolute z-10 mt-1 rounded-lg p-1.5 bg-surface shadow-lg min-w-[200px]"
                                     style={{ border: '1px solid var(--color-border)' }}
                                 >
+                                    <label
+                                        className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer hover:opacity-80 font-medium"
+                                        style={{ color: 'var(--color-text-primary)' }}
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            checked={strategies.length === enabledStrategies.length}
+                                            ref={(el) => {
+                                                if (el) el.indeterminate = strategies.length > 0 && strategies.length < enabledStrategies.length;
+                                            }}
+                                            onChange={toggleAllStrategies}
+                                        />
+                                        Select all
+                                    </label>
+                                    <div className="my-1" style={{ borderTop: '1px solid var(--color-border-light)' }} />
                                     {STRATEGIES.map((s) => (
                                         <label
                                             key={s.id}
