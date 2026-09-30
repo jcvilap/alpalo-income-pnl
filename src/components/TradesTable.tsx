@@ -16,7 +16,7 @@ import {
     useReactTable,
 } from '@tanstack/react-table';
 import { ChevronDown, ChevronRight, ChevronsUpDown, ChevronUp } from 'lucide-react';
-import type { StrategyId, StrategyTrade } from '@/lib/strategy/types';
+import type { Leg, StrategyId, StrategyTrade } from '@/lib/strategy/types';
 import { formatCurrency, formatDate } from '@/lib/format';
 
 const GROUP_OPTIONS = [
@@ -89,17 +89,36 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
 
 /**
  * The two strikes that bound the "at the money" zone for the range gauge.
- * `trade.strikes` is always sorted ascending distinct strikes — 2 for a
- * STRANGLE/DOUBLE_CALENDAR (both are the gauge's bounds), 4 for an
- * IRON_CONDOR/DOUBLE_DIAGONAL (classic wing < body < body < wing order, so
- * the two "body" strikes sit at the middle indices and the outer wings are
- * ignored). Returns null when there aren't at least 2 distinct strikes.
+ *
+ * STRANGLE/DOUBLE_CALENDAR always have exactly 2 distinct strikes (one per
+ * side) — those are the bounds, no ambiguity. IRON_CONDOR/DOUBLE_DIAGONAL/
+ * JADE_LIZARD have 4 (a near "body" leg plus a far "wing" leg per side), but
+ * the classifier shape rules (see rules.ts) only require 4 distinct strikes
+ * — they never guarantee wing < body < body < wing sorted order, so a
+ * sorted-index pick (e.g. a reverse diagonal) can silently grab a wing
+ * instead of a body. The body/near leg is unambiguous a different way,
+ * though: it's the leg on each side (call/put) with the *nearer*
+ * expiration — the wing is always the farther-dated leg by construction of
+ * a time-spread (see `detectTimeSpread` in rules.ts). Derive bounds from
+ * that instead of array position. Returns null when there aren't at least 2
+ * distinct strikes among the strategy's OPEN legs.
  */
-function innerStrikes(strikes: number[]): [number, number] | null {
+function innerStrikes(legs: Leg[]): [number, number] | null {
+    const openLegs = legs.filter(l => l.openClose === 'OPEN');
+    const strikes = Array.from(new Set(openLegs.map(l => l.strike))).sort((a, b) => a - b);
     if (strikes.length < 2) return null;
-    const lowIdx = Math.floor(strikes.length / 2) - 1;
-    const highIdx = Math.floor(strikes.length / 2);
-    return [strikes[lowIdx], strikes[highIdx]];
+    if (strikes.length === 2) return [strikes[0], strikes[1]];
+
+    // 4+ strikes: pick each side's nearest-expiration leg as its bound.
+    const nearestBySide = (right: 'CALL' | 'PUT'): number | null => {
+        const sideLegs = openLegs.filter(l => l.right === right);
+        if (sideLegs.length === 0) return null;
+        return sideLegs.reduce((nearest, l) => (l.expiration < nearest.expiration ? l : nearest)).strike;
+    };
+    const putStrike = nearestBySide('PUT');
+    const callStrike = nearestBySide('CALL');
+    if (putStrike == null || callStrike == null) return null;
+    return putStrike <= callStrike ? [putStrike, callStrike] : [callStrike, putStrike];
 }
 
 /**
@@ -468,7 +487,7 @@ const columns: ColumnDef<StrategyTrade>[] = [
         header: 'Range',
         cell: (ctx) => {
             const trade = ctx.row.original;
-            const bounds = innerStrikes(trade.strikes);
+            const bounds = innerStrikes(trade.legs);
             if (!bounds || trade.underlyingPrice == null) return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             const [low, high] = bounds;
             return <RangeGauge low={low} high={high} price={trade.underlyingPrice} />;

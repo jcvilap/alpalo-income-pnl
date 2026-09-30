@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v21';
+const STRATEGY_VERSION = 'v22';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -225,6 +225,7 @@ async function applyUnrealizedPnl(
     }
 
     const OPTION_MULTIPLIER = 100;
+    const now = new Date().toISOString();
     for (const trade of openTrades) {
         let closeValue = 0;
         let missingQuote = false;
@@ -259,17 +260,29 @@ async function applyUnrealizedPnl(
             }
 
             const quote = leg.symbol ? quotes[leg.symbol] : undefined;
-            if (!quote || typeof quote.mark !== 'number') {
+            const hasQuote = !!quote && typeof quote.mark === 'number';
+            // Schwab stops quoting an option once it's past expiration — a
+            // leg nobody explicitly closed (e.g. it expired worthless
+            // out-of-the-money, with no assignment/exercise transaction)
+            // would otherwise trip `missingQuote` and silently drop the
+            // *entire* trade's P&L. We actually know the right value for an
+            // expired leg with no quote — 0, since it's no longer tradeable —
+            // so price it at 0 instead of aborting the whole trade. A leg
+            // still quoted despite being past expiration (e.g. same-day
+            // expiry still settling) is priced normally from its live mark.
+            const expired = differenceInCalendarDays(parseISO(leg.expiration), parseISO(now)) < 0;
+            if (!hasQuote && !expired) {
                 missingQuote = true;
                 break;
             }
-            closeValue += leg.quantity * quote.mark * OPTION_MULTIPLIER;
+            const mark = hasQuote ? quote!.mark! : 0;
+            closeValue += leg.quantity * mark * OPTION_MULTIPLIER;
 
             // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
             // detail row. Same math as the whole-trade figure below, just
             // scoped to this one leg's own openNet/closeValue.
             if (trade.strategy === 'STRANGLE' && leg.openNet != null) {
-                const legCloseValue = leg.quantity * quote.mark * OPTION_MULTIPLIER;
+                const legCloseValue = leg.quantity * mark * OPTION_MULTIPLIER;
                 const legPnl = leg.openNet + legCloseValue;
                 leg.closeNet = legCloseValue;
                 leg.pnl = legPnl;
