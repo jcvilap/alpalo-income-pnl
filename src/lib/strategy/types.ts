@@ -157,6 +157,13 @@ export interface StrategyTrade {
      * when the trade was opened.
      */
     expirationDtes: number[];
+    /**
+     * Live underlying mark (or lastPrice fallback) at the time of the last
+     * quote fetch. Only set for open trades — see `applyUnrealizedPnl` in
+     * transactions/service.ts. Powers the strikes-vs-price range gauge in
+     * the UI.
+     */
+    underlyingPrice?: number;
 }
 
 export interface StrategyMetrics {

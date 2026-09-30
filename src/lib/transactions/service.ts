@@ -16,6 +16,24 @@ const PARSED_TTL_SECONDS = 15 * 60;
 /** Schwab's /transactions endpoint rejects ranges wider than ~1 year; stay just under it. */
 const SCHWAB_MAX_LOOKBACK_DAYS = 364;
 
+/**
+ * Schwab's `/quotes` endpoint doesn't recognize an option's underlying root
+ * (e.g. "SPXW") as a quotable symbol for cash-settled indexes — it wants the
+ * $-prefixed index symbol instead. Equity/ETF underlyings (QQQ, SPY, ...)
+ * need no translation. See `tosUnderlying` in lib/convert/buildOrderString.ts
+ * for the analogous (but separate) SPXW->SPX root-stripping used there.
+ */
+const INDEX_QUOTE_SYMBOLS: Record<string, string> = {
+    SPX: '$SPX', SPXW: '$SPX',
+    NDX: '$NDX', NDXP: '$NDX',
+    RUT: '$RUT', RUTW: '$RUT',
+    VIX: '$VIX', VIXW: '$VIX',
+};
+
+function quoteSymbolFor(underlying: string): string {
+    return INDEX_QUOTE_SYMBOLS[underlying] ?? underlying;
+}
+
 export interface TradesResult {
     strategies: StrategyId[];
     range: { from: string; to: string };
@@ -179,7 +197,7 @@ async function applyUnrealizedPnl(
     // mark-to-market P&L without a second round-trip. Schwab's /quotes
     // endpoint accepts equity symbols the same as option symbols.
     const underlyingSymbols = Array.from(
-        new Set(openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => l.underlying))),
+        new Set(openTrades.flatMap(t => t.legs.filter(l => l.openClose === 'OPEN').map(l => quoteSymbolFor(l.underlying)))),
     );
     const symbols = Array.from(new Set([...optionSymbols, ...underlyingSymbols]));
     if (symbols.length === 0) return;
@@ -227,7 +245,7 @@ async function applyUnrealizedPnl(
             // this leg (and, since `missingQuote` aborts the whole trade,
             // every later leg too). Index underlyings (e.g. SPX) often don't
             // carry `mark` on their quote payload, so fall back to `lastPrice`.
-            const underlyingQuote = quotes[leg.underlying];
+            const underlyingQuote = quotes[quoteSymbolFor(leg.underlying)];
             const underlyingPrice = typeof underlyingQuote?.mark === 'number'
                 ? underlyingQuote.mark
                 : typeof underlyingQuote?.lastPrice === 'number'
@@ -237,6 +255,7 @@ async function applyUnrealizedPnl(
                 leg.itm = leg.right === 'CALL'
                     ? underlyingPrice > leg.strike
                     : underlyingPrice < leg.strike;
+                trade.underlyingPrice = underlyingPrice;
             }
 
             const quote = leg.symbol ? quotes[leg.symbol] : undefined;

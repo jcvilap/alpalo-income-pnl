@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import {
     type ColumnDef,
@@ -67,7 +67,7 @@ function orderByPinning<T extends { column: { getIsPinned: () => 'left' | 'right
     return [...left, ...center, ...right];
 }
 
-const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations']);
+const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations', 'range']);
 
 /** True for trades that can show a per-leg breakdown row: strangles only (open or closed). */
 function hasLegDetail(trade: StrategyTrade): boolean {
@@ -85,6 +85,210 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
         getValue: () => (trade as unknown as Record<string, unknown>)[columnId],
         row: { original: trade },
     } as never;
+}
+
+/**
+ * The two strikes that bound the "at the money" zone for the range gauge.
+ * `trade.strikes` is always sorted ascending distinct strikes — 2 for a
+ * STRANGLE/DOUBLE_CALENDAR (both are the gauge's bounds), 4 for an
+ * IRON_CONDOR/DOUBLE_DIAGONAL (classic wing < body < body < wing order, so
+ * the two "body" strikes sit at the middle indices and the outer wings are
+ * ignored). Returns null when there aren't at least 2 distinct strikes.
+ */
+function innerStrikes(strikes: number[]): [number, number] | null {
+    if (strikes.length < 2) return null;
+    const lowIdx = Math.floor(strikes.length / 2) - 1;
+    const highIdx = Math.floor(strikes.length / 2);
+    return [strikes[lowIdx], strikes[highIdx]];
+}
+
+/**
+ * Format an ITM% for the range tooltip with just enough decimal places to
+ * show its true magnitude — a razor-thin breach (e.g. 0.001%) would round to
+ * "0%" at fixed precision and read as "not breached", so this grows the
+ * precision until a nonzero value is visible (capped at 4 decimals), then
+ * trims trailing zeros. A clean breach still prints as a bare "1%"/"12%".
+ */
+function formatItmPct(pct: number): string {
+    if (pct === 0) return '0';
+    for (let digits = 0; digits <= 4; digits++) {
+        const fixed = pct.toFixed(digits);
+        if (parseFloat(fixed) !== 0) return String(parseFloat(fixed));
+    }
+    return pct.toFixed(4);
+}
+
+/** Data the shared singleton tooltip needs to render for whichever gauge is currently hovered/tapped. */
+interface RangeTooltipData {
+    price: number;
+    low: number;
+    high: number;
+    /** Viewport-relative anchor (the hovered/tapped gauge's bounding rect) to position the fixed tooltip against. */
+    anchor: { top: number; left: number; width: number };
+}
+
+/**
+ * Tiny module-level pub/sub so every `RangeGauge` cell can publish "I'm
+ * hovered/tapped" without each one owning React state — with 30+ gauges on
+ * screen, per-cell state would mean 30+ components re-rendering on mount
+ * just to wire up handlers. Only the single `RangeTooltipHost` subscriber
+ * re-renders, and only while something is actually active.
+ */
+let rangeTooltipListener: ((data: RangeTooltipData | null) => void) | null = null;
+function publishRangeTooltip(data: RangeTooltipData | null) {
+    rangeTooltipListener?.(data);
+}
+
+/**
+ * Single shared tooltip node for every `RangeGauge` in the table — mounted
+ * once (in `TradesTable`), positioned via `position: fixed` against the
+ * hovered/tapped gauge's bounding rect so it always escapes the table's
+ * `overflow-x: auto` scroll clipping regardless of which row it's in.
+ * Renders null (no DOM) when nothing is active. On touch devices a tap on
+ * any gauge opens it (see `RangeGauge`); tapping anywhere else closes it.
+ */
+function RangeTooltipHost() {
+    const [data, setData] = useState<RangeTooltipData | null>(null);
+
+    useEffect(() => {
+        rangeTooltipListener = setData;
+        return () => {
+            rangeTooltipListener = null;
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!data) return;
+        const close = () => setData(null);
+        // Capture phase + a microtask-delayed attach would both work; a
+        // plain listener is enough since the opening tap's event has
+        // already finished dispatching by the time this effect runs.
+        document.addEventListener('touchstart', close);
+        document.addEventListener('scroll', close, true);
+        return () => {
+            document.removeEventListener('touchstart', close);
+            document.removeEventListener('scroll', close, true);
+        };
+    }, [data]);
+
+    if (!data) return null;
+    const { price, low, high, anchor } = data;
+
+    const breachedLow = price <= low;
+    const breachedHigh = price >= high;
+    const itmPct = breachedLow
+        ? ((low - price) / low) * 100
+        : breachedHigh
+            ? ((price - high) / high) * 100
+            : null;
+
+    const rows: { label: string; value: string }[] = [
+        { label: 'Underlying', value: price.toFixed(2) },
+        { label: 'Lower Strike', value: String(low) },
+        { label: 'Upper Strike', value: String(high) },
+    ];
+    if (itmPct != null) rows.push({ label: 'ITM %', value: `${formatItmPct(itmPct)}%` });
+
+    return (
+        <div
+            role="tooltip"
+            className="rounded-lg px-3 py-2 text-xs shadow-lg bg-surface-elevated"
+            style={{
+                position: 'fixed',
+                zIndex: 50,
+                top: anchor.top - 6,
+                left: anchor.left + anchor.width / 2,
+                transform: 'translate(-50%, -100%)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text-primary)',
+                width: 176,
+                pointerEvents: 'none',
+            }}
+        >
+            <div className="flex flex-col gap-0.5">
+                {rows.map((r) => (
+                    <div key={r.label} className="flex items-center justify-between gap-3 tabular-nums whitespace-nowrap leading-tight">
+                        <span style={{ color: 'var(--color-text-tertiary)' }}>{r.label}</span>
+                        <span className="font-medium">{r.value}</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+/**
+ * Gradient gauge: shows the underlying price's position relative to the two
+ * inner strikes bounding this strategy. Filled track between the strikes
+ * gradients green (safe, centered) to red (near/at a strike); a dot marks
+ * the live price. Padding on either side of the strikes gives the dot room
+ * to show outside the band when price has moved beyond a strike. Hovering
+ * publishes to the shared `RangeTooltipHost` (see above) rather than
+ * rendering its own tooltip, so only one tooltip DOM node ever exists.
+ */
+function RangeGauge({ low, high, price }: { low: number; high: number; price: number }) {
+    const span = high - low;
+    const pad = span > 0 ? span * 0.18 : Math.max(1, low * 0.05);
+    const trackLow = low - pad;
+    const trackHigh = high + pad;
+    const trackSpan = trackHigh - trackLow || 1;
+
+    const bandLow = (low - trackLow) / trackSpan;
+    const bandHigh = (high - trackLow) / trackSpan;
+    const pricePos = Math.max(0, Math.min(1, (price - trackLow) / trackSpan));
+
+    const breached = price <= low || price >= high;
+    const distToEdge = span > 0 ? Math.min(price - low, high - price) / span : 0;
+    const zone: 'safe' | 'warn' | 'danger' = breached ? 'danger' : distToEdge < 0.15 ? 'warn' : 'safe';
+    const dotColor = zone === 'danger' ? 'var(--color-danger)' : zone === 'warn' ? '#d97706' : 'var(--color-success)';
+
+    const publish = (rect: DOMRect) => {
+        publishRangeTooltip({ price, low, high, anchor: { top: rect.top, left: rect.left, width: rect.width } });
+    };
+    const handleEnter = (e: React.MouseEvent<HTMLSpanElement>) => publish(e.currentTarget.getBoundingClientRect());
+    const handleLeave = () => publishRangeTooltip(null);
+    // Touch devices have no hover state — a tap opens the tooltip instead;
+    // `RangeTooltipHost` closes it on the next touch anywhere (including a
+    // second tap on this same gauge) or on scroll. stopPropagation keeps
+    // that same tap from also being read as "outside" by the host's own
+    // touchstart listener, which would otherwise close it in the same event.
+    const handleTouch = (e: React.TouchEvent<HTMLSpanElement>) => {
+        e.stopPropagation();
+        publish(e.currentTarget.getBoundingClientRect());
+    };
+
+    return (
+        <span
+            onMouseEnter={handleEnter}
+            onMouseLeave={handleLeave}
+            onTouchStart={handleTouch}
+            style={{ position: 'relative', display: 'inline-block', width: 110, height: 16, verticalAlign: 'middle' }}
+        >
+            <span
+                style={{
+                    position: 'absolute', left: 0, right: 0, top: 5, height: 6, borderRadius: 3,
+                    background: 'var(--color-border-light)',
+                }}
+            />
+            <span
+                style={{
+                    position: 'absolute', top: 5, height: 6, borderRadius: 3,
+                    left: `${bandLow * 100}%`,
+                    width: `${Math.max(0, bandHigh - bandLow) * 100}%`,
+                    opacity: 0.55,
+                    background: 'linear-gradient(90deg, var(--color-danger), #d97706 22%, var(--color-success) 45%, var(--color-success) 55%, #d97706 78%, var(--color-danger))',
+                }}
+            />
+            <span style={{ position: 'absolute', left: `${bandLow * 100}%`, top: 2, width: 1.5, height: 12, background: 'var(--color-text-tertiary)' }} />
+            <span style={{ position: 'absolute', left: `${bandHigh * 100}%`, top: 2, width: 1.5, height: 12, background: 'var(--color-text-tertiary)', transform: 'translateX(-1.5px)' }} />
+            <span
+                style={{
+                    position: 'absolute', left: `${pricePos * 100}%`, top: -1, width: 9, height: 9, marginLeft: -4.5,
+                    borderRadius: '50%', background: dotColor, border: '2px solid var(--color-surface)',
+                }}
+            />
+        </span>
+    );
 }
 
 /** Remaining calendar days to `expiration`, measured from now, floored at 0. */
@@ -260,6 +464,18 @@ const columns: ColumnDef<StrategyTrade>[] = [
         ),
     },
     {
+        id: 'range',
+        header: 'Range',
+        cell: (ctx) => {
+            const trade = ctx.row.original;
+            const bounds = innerStrikes(trade.strikes);
+            if (!bounds || trade.underlyingPrice == null) return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
+            const [low, high] = bounds;
+            return <RangeGauge low={low} high={high} price={trade.underlyingPrice} />;
+        },
+        enableSorting: false,
+    },
+    {
         accessorKey: 'pnl',
         header: 'P&L',
         cell: (ctx) => {
@@ -352,6 +568,7 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
 
     return (
         <div className="flex flex-col gap-3">
+            <RangeTooltipHost />
             {/* Toolbar */}
             <div className="flex flex-wrap items-center gap-3">
                 <input
