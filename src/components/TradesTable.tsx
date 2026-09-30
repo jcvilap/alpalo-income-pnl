@@ -491,6 +491,11 @@ const columns: ColumnDef<StrategyTrade>[] = [
         header: 'Range',
         cell: (ctx) => {
             const trade = ctx.row.original;
+            // A closed trade's underlying price (if any) is a frozen
+            // snapshot from whenever it was last live, not a current
+            // reading — showing a gauge against it would misrepresent it
+            // as still meaningful to compare against today's market.
+            if (trade.status === 'closed') return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             const bounds = innerStrikes(trade.legs);
             if (!bounds || trade.underlyingPrice == null) return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             const [low, high] = bounds;

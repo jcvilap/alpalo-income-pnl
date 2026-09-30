@@ -374,7 +374,14 @@ async function applyUnrealizedPnl(
                 leg.pnl = leg.openNet ?? 0;
                 leg.pnlIsEstimate = false;
                 leg.pctGain = leg.openNet && leg.openNet !== 0 ? (leg.pnl / Math.abs(leg.openNet)) * 100 : undefined;
+                leg.itm = undefined;
             }
+            // Clear the live-quote snapshot now that the trade is done —
+            // it's a frozen "as of last live check" reading, not a current
+            // price, and a closed trade has nothing left to compare it
+            // against (see the Range column's `status === 'closed'` guard
+            // in TradesTable.tsx).
+            trade.underlyingPrice = undefined;
             anyFinalized = true;
         } else {
             trade.pnlIsEstimate = true;
