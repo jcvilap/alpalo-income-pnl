@@ -98,15 +98,24 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
  * wings + one middle body) — the body is excluded from the range since it's
  * never a boundary of the position's breakeven zone; the two wing strikes
  * (min/max) are the bounds regardless of symmetric or broken-wing shape.
- * IRON_CONDOR/DOUBLE_DIAGONAL/JADE_LIZARD have 4 (a near "body" leg plus a
- * far "wing" leg per side), but the classifier shape rules (see rules.ts)
- * only require 4 distinct strikes — they never guarantee wing < body < body
- * < wing sorted order, so a sorted-index pick (e.g. a reverse diagonal) can
- * silently grab a wing instead of a body. The body/near leg is unambiguous a
- * different way, though: it's the leg on each side (call/put) with the
- * *nearer* expiration — the wing is always the farther-dated leg by
- * construction of a time-spread (see `detectTimeSpread` in rules.ts). Derive
- * bounds from that instead of array position.
+ *
+ * IRON_CONDOR and DOUBLE_DIAGONAL/JADE_LIZARD both have 4 distinct strikes,
+ * but they need different logic to find the inner "body" pair:
+ *
+ * - IRON_CONDOR's 4 legs all share one expiration (see IRON_CONDOR_RULE), so
+ *   "nearest expiration per side" can't disambiguate body from wing there —
+ *   every leg ties, and picking one is effectively arbitrary leg-array order.
+ *   IRON_CONDOR_RULE already guarantees classic condor strike order (put
+ *   wing < put body < call body < call wing), so the body pair is just the
+ *   middle two strikes once sorted — no need to look at right/expiration.
+ * - DOUBLE_DIAGONAL/JADE_LIZARD legs span two expirations, and the shape
+ *   rules only require 4 distinct strikes — they never guarantee wing <
+ *   body < body < wing sorted order, so a sorted-index pick (e.g. a reverse
+ *   diagonal) can silently grab a wing instead of a body. The body/near leg
+ *   is unambiguous a different way, though: it's the leg on each side
+ *   (call/put) with the *nearer* expiration — the wing is always the
+ *   farther-dated leg by construction of a time-spread (see
+ *   `detectTimeSpread` in rules.ts). Derive bounds from that instead.
  *
  * Uses every leg, not just still-open ones: a strangle with one leg closed
  * early (see `closeStrangleLeg` in pairing.ts) still has a meaningful
@@ -114,7 +123,7 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
  * stops updating once it's closed, not the strategy's strike shape. Returns
  * null when there aren't at least 2 distinct strikes at all.
  */
-function innerStrikes(legs: Leg[]): [number, number] | null {
+function innerStrikes(legs: Leg[], strategy: StrategyId): [number, number] | null {
     const strikes = Array.from(new Set(legs.map(l => l.strike))).sort((a, b) => a - b);
     if (strikes.length < 2) return null;
     if (strikes.length === 2) return [strikes[0], strikes[1]];
@@ -123,7 +132,12 @@ function innerStrikes(legs: Leg[]): [number, number] | null {
     // the body, not a bound. Outer two strikes (wings) are the range.
     if (strikes.length === 3) return [strikes[0], strikes[2]];
 
-    // 4+ strikes: pick each side's nearest-expiration leg as its bound.
+    // Iron condor: 4 strikes, single expiration — body is the middle two
+    // once sorted (strike position alone decides body vs wing here).
+    if (strategy === 'IRON_CONDOR' && strikes.length === 4) return [strikes[1], strikes[2]];
+
+    // Double diagonal / jade lizard: 4 strikes across two expirations — pick
+    // each side's nearest-expiration leg as its bound.
     const nearestBySide = (right: 'CALL' | 'PUT'): number | null => {
         const sideLegs = legs.filter(l => l.right === right);
         if (sideLegs.length === 0) return null;
@@ -515,7 +529,7 @@ const columns: ColumnDef<StrategyTrade>[] = [
             if (trade.strategy === 'CALENDAR' || trade.strategy === 'DIAGONAL') {
                 return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             }
-            const bounds = innerStrikes(trade.legs);
+            const bounds = innerStrikes(trade.legs, trade.strategy);
             if (!bounds || trade.underlyingPrice == null) return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             const [low, high] = bounds;
             return <RangeGauge low={low} high={high} price={trade.underlyingPrice} />;
