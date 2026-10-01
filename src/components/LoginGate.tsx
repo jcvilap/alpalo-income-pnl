@@ -21,6 +21,13 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
     const [error, setError] = useState(false);
 
     useEffect(() => {
+        // Skip the speed bump entirely in local dev — there's no shared
+        // screen to protect against on localhost.
+        const isLocalhost = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
+        if (isLocalhost) {
+            setAuthed(true);
+            return;
+        }
         setAuthed(sessionStorage.getItem(SESSION_KEY) === 'true');
         const savedPassword = sessionStorage.getItem(PASSWORD_KEY);
         if (savedPassword) setPassword(savedPassword);

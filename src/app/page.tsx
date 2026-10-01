@@ -30,8 +30,11 @@ interface TradesResponse {
 const STRATEGIES = [
     { id: 'double_calendar', label: 'Double Calendar', enabled: true },
     { id: 'double_diagonal', label: 'Double Diagonal', enabled: true },
+    { id: 'calendar', label: 'Calendar', enabled: true },
+    { id: 'diagonal', label: 'Diagonal', enabled: true },
     { id: 'jade_lizard', label: 'Jade Lizard', enabled: false },
     { id: 'iron_condor', label: 'Iron Condor', enabled: true },
+    { id: 'butterfly', label: 'Butterfly', enabled: true },
     { id: 'strangle', label: 'Strangle', enabled: true },
     { id: 'leaps', label: 'LEAPS', enabled: true },
 ];
@@ -193,6 +196,12 @@ function HomeContent() {
         });
     }, []);
 
+    const selectOnlyStrategy = useCallback((id: string) => {
+        setStrategies([id]);
+        setStrategyMenuOpen(false);
+        void load(false, from, to, [id]);
+    }, [load, from, to]);
+
     // "Select all" toggles every enabled strategy at once: selects all when
     // not everything is already selected, otherwise clears back down to just
     // the first one (toggleStrategy already refuses to empty the selection
@@ -340,22 +349,38 @@ function HomeContent() {
                                     </label>
                                     <div className="my-1" style={{ borderTop: '1px solid var(--color-border-light)' }} />
                                     {STRATEGIES.map((s) => (
-                                        <label
+                                        <div
                                             key={s.id}
-                                            className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-sm ${
-                                                s.enabled ? 'cursor-pointer hover:opacity-80' : 'cursor-not-allowed opacity-50'
-                                            }`}
-                                            style={{ color: 'var(--color-text-primary)' }}
+                                            className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm group"
                                         >
-                                            <input
-                                                type="checkbox"
-                                                checked={strategies.includes(s.id)}
-                                                disabled={!s.enabled}
-                                                onChange={() => toggleStrategy(s.id)}
-                                            />
-                                            {s.label}
-                                            {!s.enabled ? ' (soon)' : ''}
-                                        </label>
+                                            <label
+                                                className={`flex items-center gap-2 flex-1 min-w-0 ${
+                                                    s.enabled ? 'cursor-pointer hover:opacity-80' : 'cursor-not-allowed opacity-50'
+                                                }`}
+                                                style={{ color: 'var(--color-text-primary)' }}
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={strategies.includes(s.id)}
+                                                    disabled={!s.enabled}
+                                                    onChange={() => toggleStrategy(s.id)}
+                                                />
+                                                <span className="truncate">
+                                                    {s.label}
+                                                    {!s.enabled ? ' (soon)' : ''}
+                                                </span>
+                                            </label>
+                                            {s.enabled && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => selectOnlyStrategy(s.id)}
+                                                    className="shrink-0 text-xs font-medium opacity-0 group-hover:opacity-100 hover:underline"
+                                                    style={{ color: 'var(--color-primary)' }}
+                                                >
+                                                    Only
+                                                </button>
+                                            )}
+                                        </div>
                                     ))}
                                 </div>
                             )}
