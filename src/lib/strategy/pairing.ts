@@ -1,6 +1,19 @@
 import { differenceInCalendarDays, parseISO } from 'date-fns';
-import type { Leg, OrderGroup, StrategyMatch, StrategyTrade } from './types';
+import type { Leg, OrderGroup, StrategyId, StrategyMatch, StrategyTrade } from './types';
 import { classifyOrder, legNetAmount, legSetSignature, legSignature } from './rules';
+
+/**
+ * Strategies whose per-leg `openNet`/`closeNet`/`pnl`/`pctGain` are tracked
+ * individually, powering the UI's per-leg detail row (see `legDetailRows` in
+ * TradesTable.tsx). STRANGLE legs can close independently of each other, so
+ * it additionally gets `openLegs`/`remainingOpenNet` tracking for that case
+ * (see `closeStrangleLeg`) — CALENDAR/DIAGONAL legs are always opened and
+ * closed together in one order, never independently, so they only need the
+ * simpler whole-order open/close stamping.
+ */
+export function tracksLegDetail(strategy: StrategyId): boolean {
+    return strategy === 'STRANGLE' || strategy === 'CALENDAR' || strategy === 'DIAGONAL';
+}
 
 function distinctSorted<T>(values: T[]): T[] {
     return Array.from(new Set(values)).sort((a, b) =>
@@ -233,15 +246,16 @@ function daysAt(fromIso: string, expiration: string): number {
 
 /**
  * Stamp each open leg's own realized `closeNet`/`pnl`/`pctGain` when a
- * STRANGLE's whole 2-leg position closes in a single order (the common case —
- * both legs closed together). Matches each open leg to its corresponding
+ * tracked strategy's whole position closes in a single order (every leg
+ * closed together — the only way CALENDAR/DIAGONAL ever close, and the
+ * common case for STRANGLE too). Matches each open leg to its corresponding
  * closing-order leg by right/strike/expiration and uses that leg's own
  * `legNetAmount` as its exact closing cash — no proportional guess needed,
  * since the closing order's own per-leg price/quantity are exact. Powers the
- * UI's per-leg detail row for closed strangles the same way `closeStrangleLeg`
- * does for independent leg closes.
+ * UI's per-leg detail row; for STRANGLE this is in addition to
+ * `closeStrangleLeg`, which handles independent (not whole-order) leg closes.
  */
-function stampStrangleLegCloses(openLegs: Leg[], closeOrderLegs: Leg[], underlying: string, closeOrderTime: string): Leg[] {
+function stampLegCloses(openLegs: Leg[], closeOrderLegs: Leg[], underlying: string, closeOrderTime: string): Leg[] {
     return openLegs.map(leg => {
         const sig = legSignature(underlying, leg);
         const closingLeg = closeOrderLegs.find(l => legSignature(underlying, l) === sig);
@@ -556,7 +570,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                     match,
                     totalContracts: contracts,
                     remainingContracts: contracts,
-                    openLegs: match.strategy === 'STRANGLE'
+                    openLegs: tracksLegDetail(match.strategy)
                         ? match.order.legs.map(l => ({ ...l, openNet: legNetAmount(l) }))
                         : undefined,
                     remainingOpenNet: match.strategy === 'STRANGLE' ? match.order.netAmount : undefined,
@@ -586,8 +600,8 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 const consumedOpenLegs = lot.openLegs && consumed !== lot.totalContracts
                     ? scaleLegs(lot.openLegs, lot.totalContracts, consumed)
                     : lot.openLegs;
-                const liveLegs = lot.match.strategy === 'STRANGLE' && consumedOpenLegs
-                    ? stampStrangleLegCloses(consumedOpenLegs, match.order.legs, lot.match.order.underlying, match.order.time)
+                const liveLegs = tracksLegDetail(lot.match.strategy) && consumedOpenLegs
+                    ? stampLegCloses(consumedOpenLegs, match.order.legs, lot.match.order.underlying, match.order.time)
                     : lot.openLegs;
                 const shape = toTradeShape(lot.match, consumed, liveLegs, lot.closedLegs);
                 const pnl = openShare + closeShare;

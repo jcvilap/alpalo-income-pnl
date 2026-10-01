@@ -72,9 +72,9 @@ function orderByPinning<T extends { column: { getIsPinned: () => 'left' | 'right
 
 const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations', 'range']);
 
-/** True for trades that can show a per-leg breakdown row: strangles only (open or closed). */
+/** True for trades that can show a per-leg breakdown row: strangles, calendars, and diagonals (open or closed). */
 function hasLegDetail(trade: StrategyTrade): boolean {
-    return trade.strategy === 'STRANGLE';
+    return trade.strategy === 'STRANGLE' || trade.strategy === 'CALENDAR' || trade.strategy === 'DIAGONAL';
 }
 
 /**

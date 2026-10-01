@@ -4,7 +4,7 @@ import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/
 import { SchwabClient, type SchwabQuote, type SchwabTransaction } from '@/live/schwabClient';
 import { withRedis } from '@/lib/redis';
 import { normalizeToOrderGroups } from '@/lib/strategy/normalize';
-import { buildTrades, safeHoldDays } from '@/lib/strategy/pairing';
+import { buildTrades, safeHoldDays, tracksLegDetail } from '@/lib/strategy/pairing';
 import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
 
@@ -426,8 +426,8 @@ async function applyUnrealizedPnl(
         const candidateWorthlessLegs: typeof trade.legs = [];
         for (const leg of trade.legs) {
             if (leg.openClose === 'CLOSE') {
-                if (trade.strategy === 'STRANGLE' && leg.pnl != null) realizedLegPnl += leg.pnl;
-                if (trade.strategy === 'STRANGLE' && leg.closeNet != null) realizedLegCloseNet += leg.closeNet;
+                if (tracksLegDetail(trade.strategy) && leg.pnl != null) realizedLegPnl += leg.pnl;
+                if (tracksLegDetail(trade.strategy) && leg.closeNet != null) realizedLegCloseNet += leg.closeNet;
                 continue;
             }
             // ITM only needs the underlying's own price, not the option's
@@ -488,10 +488,11 @@ async function applyUnrealizedPnl(
                 allExpiredWithinHorizonAndNoQuote = false;
             }
 
-            // Per-leg mark-to-market, STRANGLE only — powers the UI's per-leg
-            // detail row. Same math as the whole-trade figure below, just
-            // scoped to this one leg's own openNet/closeValue.
-            if (trade.strategy === 'STRANGLE' && leg.openNet != null) {
+            // Per-leg mark-to-market for strategies that track leg detail
+            // (see `tracksLegDetail`) — powers the UI's per-leg detail row.
+            // Same math as the whole-trade figure below, just scoped to this
+            // one leg's own openNet/closeValue.
+            if (tracksLegDetail(trade.strategy) && leg.openNet != null) {
                 const legCloseValue = leg.quantity * mark * OPTION_MULTIPLIER;
                 const legPnl = leg.openNet + legCloseValue;
                 leg.closeNet = legCloseValue;
