@@ -198,7 +198,9 @@ function HomeContent() {
 
     const selectOnlyStrategy = useCallback((id: string) => {
         setStrategies([id]);
-    }, []);
+        setStrategyMenuOpen(false);
+        void load(false, from, to, [id]);
+    }, [load, from, to]);
 
     // "Select all" toggles every enabled strategy at once: selects all when
     // not everything is already selected, otherwise clears back down to just
