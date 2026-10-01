@@ -36,12 +36,23 @@ interface TimeSpread {
  * and require one long + one short across the two expirations. Strikes may
  * be equal (calendar) or different (diagonal) — callers decide which shape
  * they need.
+ *
+ * Both legs must share the same `openClose` (both OPEN, or both CLOSE). A
+ * *roll* — closing a near-dated leg while opening an unrelated far-dated one
+ * in the same Schwab order, a very common single order shape — has the exact
+ * same one-short/one-long, two-expiration structure as a genuine calendar/
+ * diagonal open, but the two legs are economically unrelated positions that
+ * just happen to share an orderId. Requiring uniform openClose excludes
+ * rolls (one leg OPEN, one CLOSE) while still matching a real calendar's
+ * symmetric open (both OPEN) and same-order close (both CLOSE).
  */
 function detectTimeSpread(legsOfRight: Leg[]): TimeSpread | null {
     if (legsOfRight.length !== 2) return null;
 
     const expirations = Array.from(new Set(legsOfRight.map(l => l.expiration))).sort();
     if (expirations.length !== 2) return null;
+
+    if (legsOfRight[0].openClose !== legsOfRight[1].openClose) return null;
 
     const [near, far] = expirations;
     const nearLeg = legsOfRight.find(l => l.expiration === near)!;
