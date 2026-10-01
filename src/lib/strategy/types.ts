@@ -15,8 +15,11 @@ export type OpenClose = 'OPEN' | 'CLOSE';
 export type StrategyId =
     | 'DOUBLE_CALENDAR'
     | 'DOUBLE_DIAGONAL'
+    | 'CALENDAR'
+    | 'DIAGONAL'
     | 'JADE_LIZARD'
     | 'IRON_CONDOR'
+    | 'BUTTERFLY'
     | 'STRANGLE'
     | 'LEAPS'
     | 'UNKNOWN';

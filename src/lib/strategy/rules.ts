@@ -129,6 +129,43 @@ export const DOUBLE_DIAGONAL_RULE: StrategyRule = {
     },
 };
 
+/**
+ * Single calendar: one time spread (same strike on both expirations) in a
+ * single right — a call calendar or a put calendar, not paired with the
+ * other right the way DOUBLE_CALENDAR_RULE requires. 2-leg orders only, so
+ * this never collides with DOUBLE_CALENDAR_RULE's 4-leg shape.
+ */
+export const CALENDAR_RULE: StrategyRule = {
+    id: 'CALENDAR',
+    name: 'Calendar',
+    matches(order: OrderGroup): boolean {
+        const legs = order.legs;
+        if (legs.length !== 2) return false;
+        if (legs[0].right !== legs[1].right) return false;
+
+        const spread = detectTimeSpread(legs);
+        return spread != null && spread.nearStrike === spread.farStrike;
+    },
+};
+
+/**
+ * Single diagonal: one time spread with different strikes on the near/far
+ * expirations, in a single right — a call diagonal or a put diagonal, not
+ * paired with the other right the way DOUBLE_DIAGONAL_RULE requires.
+ */
+export const DIAGONAL_RULE: StrategyRule = {
+    id: 'DIAGONAL',
+    name: 'Diagonal',
+    matches(order: OrderGroup): boolean {
+        const legs = order.legs;
+        if (legs.length !== 2) return false;
+        if (legs[0].right !== legs[1].right) return false;
+
+        const spread = detectTimeSpread(legs);
+        return spread != null && spread.nearStrike !== spread.farStrike;
+    },
+};
+
 /** A year, in days, for the LEAPS long-dated threshold. */
 const LEAPS_MIN_DAYS = 365;
 
@@ -254,11 +291,59 @@ export const IRON_CONDOR_RULE: StrategyRule = {
     },
 };
 
+/**
+ * Butterfly: 3 legs, same right (all calls or all puts), same expiration,
+ * three distinct strikes low < body < high, with the body short twice the
+ * wings' combined quantity and each wing long in the same direction. Covers
+ * both symmetric butterflies (body - low === high - body) and broken-wing
+ * butterflies (unequal wing widths, e.g. a 25-wide lower wing + 100-wide
+ * upper wing) — wing width isn't part of the shape check.
+ *
+ * Strike position (not quantity sign) decides body vs wings, same rationale
+ * as IRON_CONDOR_RULE: this keeps the rule symmetric between opening (short
+ * body / long wings) and closing (buy back the body / sell the wings).
+ */
+export const BUTTERFLY_RULE: StrategyRule = {
+    id: 'BUTTERFLY',
+    name: 'Butterfly',
+    matches(order: OrderGroup): boolean {
+        const legs = order.legs;
+        if (legs.length !== 3) return false;
+
+        const right = legs[0].right;
+        if (!legs.every(l => l.right === right)) return false;
+
+        const expirations = new Set(legs.map(l => l.expiration));
+        if (expirations.size !== 1) return false;
+
+        const strikes = Array.from(new Set(legs.map(l => l.strike))).sort((a, b) => a - b);
+        if (strikes.length !== 3) return false;
+        const [low, body, high] = strikes;
+
+        const lowLeg = legs.find(l => l.strike === low)!;
+        const bodyLeg = legs.find(l => l.strike === body)!;
+        const highLeg = legs.find(l => l.strike === high)!;
+
+        // Wings share one direction, body the opposite, and the body's size
+        // matches the wings' combined size (classic 1-2-1 or broken-wing
+        // ratio) — never flat.
+        if (bodyLeg.quantity === 0 || lowLeg.quantity === 0 || highLeg.quantity === 0) return false;
+        if (Math.sign(lowLeg.quantity) !== Math.sign(highLeg.quantity)) return false;
+        if (Math.sign(bodyLeg.quantity) === Math.sign(lowLeg.quantity)) return false;
+        if (Math.abs(bodyLeg.quantity) !== Math.abs(lowLeg.quantity) + Math.abs(highLeg.quantity)) return false;
+
+        return low < body && body < high;
+    },
+};
+
 /** Registry of active strategy rules. Order = detection priority. */
 export const STRATEGY_RULES: StrategyRule[] = [
     DOUBLE_CALENDAR_RULE,
     DOUBLE_DIAGONAL_RULE,
     IRON_CONDOR_RULE,
+    BUTTERFLY_RULE,
+    CALENDAR_RULE,
+    DIAGONAL_RULE,
     STRANGLE_RULE,
     LEAPS_RULE,
 ];

@@ -29,8 +29,11 @@ const GROUP_OPTIONS = [
 const STRATEGY_LABELS: Record<StrategyId, string> = {
     DOUBLE_CALENDAR: 'Double Calendar',
     DOUBLE_DIAGONAL: 'Double Diagonal',
+    CALENDAR: 'Calendar',
+    DIAGONAL: 'Diagonal',
     JADE_LIZARD: 'Jade Lizard',
     IRON_CONDOR: 'Iron Condor',
+    BUTTERFLY: 'Butterfly',
     STRANGLE: 'Strangle',
     LEAPS: 'LEAPS',
     UNKNOWN: 'Unknown',
@@ -91,16 +94,19 @@ function fakeCellContext(columnId: string, trade: StrategyTrade) {
  * The two strikes that bound the "at the money" zone for the range gauge.
  *
  * STRANGLE/DOUBLE_CALENDAR always have exactly 2 distinct strikes (one per
- * side) — those are the bounds, no ambiguity. IRON_CONDOR/DOUBLE_DIAGONAL/
- * JADE_LIZARD have 4 (a near "body" leg plus a far "wing" leg per side), but
- * the classifier shape rules (see rules.ts) only require 4 distinct strikes
- * — they never guarantee wing < body < body < wing sorted order, so a
- * sorted-index pick (e.g. a reverse diagonal) can silently grab a wing
- * instead of a body. The body/near leg is unambiguous a different way,
- * though: it's the leg on each side (call/put) with the *nearer*
- * expiration — the wing is always the farther-dated leg by construction of
- * a time-spread (see `detectTimeSpread` in rules.ts). Derive bounds from
- * that instead of array position.
+ * side) — those are the bounds, no ambiguity. BUTTERFLY has 3 (two outer
+ * wings + one middle body) — the body is excluded from the range since it's
+ * never a boundary of the position's breakeven zone; the two wing strikes
+ * (min/max) are the bounds regardless of symmetric or broken-wing shape.
+ * IRON_CONDOR/DOUBLE_DIAGONAL/JADE_LIZARD have 4 (a near "body" leg plus a
+ * far "wing" leg per side), but the classifier shape rules (see rules.ts)
+ * only require 4 distinct strikes — they never guarantee wing < body < body
+ * < wing sorted order, so a sorted-index pick (e.g. a reverse diagonal) can
+ * silently grab a wing instead of a body. The body/near leg is unambiguous a
+ * different way, though: it's the leg on each side (call/put) with the
+ * *nearer* expiration — the wing is always the farther-dated leg by
+ * construction of a time-spread (see `detectTimeSpread` in rules.ts). Derive
+ * bounds from that instead of array position.
  *
  * Uses every leg, not just still-open ones: a strangle with one leg closed
  * early (see `closeStrangleLeg` in pairing.ts) still has a meaningful
@@ -112,6 +118,10 @@ function innerStrikes(legs: Leg[]): [number, number] | null {
     const strikes = Array.from(new Set(legs.map(l => l.strike))).sort((a, b) => a - b);
     if (strikes.length < 2) return null;
     if (strikes.length === 2) return [strikes[0], strikes[1]];
+
+    // Butterfly: 3 strikes, single expiration/right — the middle strike is
+    // the body, not a bound. Outer two strikes (wings) are the range.
+    if (strikes.length === 3) return [strikes[0], strikes[2]];
 
     // 4+ strikes: pick each side's nearest-expiration leg as its bound.
     const nearestBySide = (right: 'CALL' | 'PUT'): number | null => {
@@ -500,6 +510,11 @@ const columns: ColumnDef<StrategyTrade>[] = [
             // reading — showing a gauge against it would misrepresent it
             // as still meaningful to compare against today's market.
             if (trade.status === 'closed') return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
+            // A single calendar/diagonal's strikes mark a time spread, not a
+            // price range to stay between — no gauge to show.
+            if (trade.strategy === 'CALENDAR' || trade.strategy === 'DIAGONAL') {
+                return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
+            }
             const bounds = innerStrikes(trade.legs);
             if (!bounds || trade.underlyingPrice == null) return <span style={{ color: 'var(--color-text-tertiary)' }}>—</span>;
             const [low, high] = bounds;
