@@ -914,17 +914,21 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
     // — `DOUBLE_DIAGONAL` (confirmed against this account's own manually-
     // placed working orders; Schwab's taxonomy doesn't distinguish a
     // calendar as its own complex type, since it's just a diagonal with
-    // matching strikes). `CUSTOM` is technically accepted for any leg
-    // combination, but doesn't match what a real double calendar/diagonal
-    // order looks like on this account and may be treated differently for
-    // tick-size/margin/routing purposes — use the named type since
-    // `TAKE_PROFIT_STRATEGIES` only ever covers these two shapes.
+    // matching strikes). But that label only fits a genuine 4-leg order — a
+    // trade whose call-side or put-side half already closed independently
+    // (see `closeDoubleHalf` in pairing.ts) stays `status: 'open'` with just
+    // the other 2-leg half remaining, and the take-profit UI still offers it
+    // for that trade. Labeling a 2-leg order `DOUBLE_DIAGONAL` would send
+    // Schwab a shape mismatch it can reject, so fall back to `CUSTOM` (which
+    // Schwab accepts for any leg combination) whenever there aren't exactly
+    // 4 legs to close (Codex's PR #15 review).
+    const complexOrderStrategyType: 'DOUBLE_DIAGONAL' | 'CUSTOM' = openLegs.length === 4 ? 'DOUBLE_DIAGONAL' : 'CUSTOM';
     const orderRequest = {
         orderType,
         session: 'NORMAL' as const,
         duration: 'GOOD_TILL_CANCEL' as const,
         orderStrategyType: 'SINGLE' as const,
-        complexOrderStrategyType: 'DOUBLE_DIAGONAL' as const,
+        complexOrderStrategyType,
         price,
         orderLegCollection,
     };
