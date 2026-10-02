@@ -900,6 +900,13 @@ function buildColumns(onCancelled: () => void): ColumnDef<StrategyTrade>[] {
     {
         id: 'actions',
         header: '',
+        // Matches the column's actual rendered width (24px button + px-3's
+        // 24px of horizontal padding) — sticky-right pinning positions this
+        // and the "% Gain" column before it using each column's `size`
+        // (TanStack defaults to 150 when unset), so leaving this at the
+        // default left a ~100px gap between the two pinned columns even
+        // though their actual rendered widths were much narrower.
+        size: 48,
         cell: (ctx) => {
             if (ctx.row.getIsGrouped?.()) return null;
             const trade = ctx.row.original;
