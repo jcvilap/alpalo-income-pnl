@@ -901,7 +901,25 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
         ? Math.ceil(rawPrice / tick) * tick
         : Math.floor(rawPrice / tick) * tick) * 100) / 100;
 
-    const orderLegCollection = openLegs.map(leg => ({
+    // When replacing an existing working close order, Schwab's PUT endpoint
+    // is sensitive to leg order — confirmed live: a replace whose
+    // `orderLegCollection` legs were in a different order than the working
+    // order's own leg sequence came back "400 Order instruction cannot be
+    // replaced", even though the exact same leg set placed as a *new* order
+    // (no existing order to match against) succeeded every time. `trade.legs`
+    // has no guaranteed order of its own (see e.g. `dedupeLegsBySignature`'s
+    // own comment on this in pairing.ts), so reorder `openLegs` to match
+    // `trade.workingCloseOrder.legs`' own sequence — Schwab's canonical order
+    // for this exact working order — before building the replacement.
+    const orderedOpenLegs = trade.workingCloseOrder
+        ? [...openLegs].sort((a, b) => {
+              const sig = (l: typeof a) => `${l.right}:${l.strike}:${l.expiration}`;
+              const legOrder = trade.workingCloseOrder!.legs.map(l => `${l.right}:${l.strike}:${l.expiration}`);
+              return legOrder.indexOf(sig(a)) - legOrder.indexOf(sig(b));
+          })
+        : openLegs;
+
+    const orderLegCollection = orderedOpenLegs.map(leg => ({
         // Closing instruction is the opposite action of how the leg was
         // opened: a long (bought, quantity > 0) open leg closes by selling;
         // a short (sold, quantity < 0) open leg closes by buying back.
