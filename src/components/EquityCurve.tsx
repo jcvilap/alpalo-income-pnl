@@ -54,14 +54,7 @@ function AngledYTick({ x, y, payload }: { x?: number; y?: number; payload?: { va
  */
 export function EquityCurve({ data }: { data: Point[] }) {
     if (data.length === 0) {
-        return (
-            <div
-                className="rounded-xl p-8 text-center text-sm bg-surface"
-                style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-tertiary)' }}
-            >
-                No closed trades in this range yet.
-            </div>
-        );
+        return null;
     }
 
     const hue = 'var(--color-chart-blue)';

@@ -169,6 +169,8 @@ function formatItmPct(pct: number): string {
 interface CellTooltipRow {
     label: string;
     value: string;
+    /** Overrides the default value color, e.g. to tone a P&L figure green/red. */
+    color?: string;
 }
 
 /** Data the shared singleton tooltip needs to render for whichever cell is currently hovered/tapped. */
@@ -261,7 +263,7 @@ function CellTooltipHost() {
                 {rows.map((r, i) => (
                     <div key={`${r.label}-${i}`} className="flex items-center justify-between gap-3 tabular-nums whitespace-nowrap leading-tight">
                         <span style={{ color: 'var(--color-text-tertiary)' }}>{r.label}</span>
-                        <span className="font-medium">{r.value}</span>
+                        <span className="font-medium" style={{ color: r.color }}>{r.value}</span>
                     </div>
                 ))}
             </div>
@@ -401,6 +403,15 @@ function legShortLabel(leg: WorkingCloseOrder['legs'][number]): string {
     return `${leg.underlying} ${month}/${day} ${leg.strike}${leg.right === 'CALL' ? 'C' : 'P'}`;
 }
 
+/** Shorter display forms of Schwab's order-type/duration enums, for the close-order tooltip. */
+const ORDER_TYPE_LABELS: Record<string, string> = {
+    NET_CREDIT: 'CREDIT',
+    NET_DEBIT: 'DEBIT',
+};
+const ORDER_DURATION_LABELS: Record<string, string> = {
+    GOOD_TILL_CANCEL: 'GTC',
+};
+
 /** The "close order at 25% ($215)" cell shown in the Close column for an open trade with a matched working close order. */
 function CloseOrderCell({ order }: { order: WorkingCloseOrder }) {
     const color = order.estPnl > 0 ? 'var(--color-success)' : order.estPnl < 0 ? 'var(--color-danger)' : undefined;
@@ -410,15 +421,17 @@ function CloseOrderCell({ order }: { order: WorkingCloseOrder }) {
     // never the sign of `price` itself.
     const direction = order.orderType === 'NET_CREDIT' ? 'credit' : order.orderType === 'NET_DEBIT' ? 'debit' : '';
     const buildRows = (): CellTooltipRow[] => {
+        const orderTypeLabel = order.orderType ? (ORDER_TYPE_LABELS[order.orderType] ?? order.orderType) : 'Limit';
+        const durationLabel = order.duration ? (ORDER_DURATION_LABELS[order.duration] ?? order.duration) : undefined;
         const rows: CellTooltipRow[] = [
-            { label: 'Type', value: `${order.orderType ?? 'Limit'}${order.duration ? ` (${order.duration})` : ''}` },
+            { label: 'Type', value: `${orderTypeLabel}${durationLabel ? ` (${durationLabel})` : ''}` },
             { label: 'Limit Price', value: order.price != null ? `${formatCurrency(order.price)}${direction ? ` ${direction}` : ''}` : '—' },
             { label: 'Entered', value: order.enteredTime ? new Date(order.enteredTime).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—' },
         ];
         order.legs.forEach((leg, i) => {
             rows.push({ label: i === 0 ? 'Legs' : '', value: `${LEG_INSTRUCTION_LABELS[leg.instruction] ?? leg.instruction} ${legShortLabel(leg)}` });
         });
-        rows.push({ label: 'Est. P&L', value: `${formatCurrency(order.estPnl, { sign: true })} (${order.estPctGain >= 0 ? '+' : ''}${order.estPctGain.toFixed(0)}%)` });
+        rows.push({ label: 'Est. P&L', value: `${formatCurrency(order.estPnl, { sign: true })} (${order.estPctGain >= 0 ? '+' : ''}${order.estPctGain.toFixed(0)}%)`, color });
         return rows;
     };
     const tooltip = useCellTooltip(buildRows, 220);
@@ -758,6 +771,10 @@ function TradeCard({ trade }: { trade: StrategyTrade }) {
                     </div>
                 )}
             </div>
+
+            {trade.status === 'open' && trade.workingCloseOrder && (
+                <CloseOrderCell order={trade.workingCloseOrder} />
+            )}
 
             {showLegToggle && (
                 <button
