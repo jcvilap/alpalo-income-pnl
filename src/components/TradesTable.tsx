@@ -27,14 +27,14 @@ const GROUP_OPTIONS = [
 ] as const;
 
 const STRATEGY_LABELS: Record<StrategyId, string> = {
-    DOUBLE_CALENDAR: 'Double Calendar',
-    DOUBLE_DIAGONAL: 'Double Diagonal',
-    CALENDAR: 'Calendar',
-    DIAGONAL: 'Diagonal',
-    JADE_LIZARD: 'Jade Lizard',
-    IRON_CONDOR: 'Iron Condor',
-    BUTTERFLY: 'Butterfly',
-    STRANGLE: 'Strangle',
+    DOUBLE_CALENDAR: 'Dbl Cal',
+    DOUBLE_DIAGONAL: 'Dbl Diag',
+    CALENDAR: 'Cal',
+    DIAGONAL: 'Diag',
+    JADE_LIZARD: 'Jade Liz',
+    IRON_CONDOR: 'Iron Cdr',
+    BUTTERFLY: 'Btfly',
+    STRANGLE: 'Strgl',
     LEAPS: 'LEAPS',
     UNKNOWN: 'Unknown',
 };
@@ -172,6 +172,8 @@ interface RangeTooltipData {
     high: number;
     /** Viewport-relative anchor (the hovered/tapped gauge's bounding rect) to position the fixed tooltip against. */
     anchor: { top: number; left: number; width: number };
+    /** This trade's expiration dates and their original DTE-at-open, shown in the tooltip instead of taking up card space. */
+    expirations?: { date: string; dte: number | undefined }[];
 }
 
 /**
@@ -206,20 +208,32 @@ function RangeTooltipHost() {
 
     useEffect(() => {
         if (!data) return;
-        const close = () => setData(null);
-        // Capture phase + a microtask-delayed attach would both work; a
-        // plain listener is enough since the opening tap's event has
-        // already finished dispatching by the time this effect runs.
-        document.addEventListener('touchstart', close);
+        // A click on a *different* gauge (or the same one again) bubbles past
+        // this same click event all the way to `document` — React's synthetic
+        // stopPropagation only stops other React handlers, not a raw
+        // `addEventListener` listener further up the real DOM tree — so
+        // without the `[data-range-gauge]` check below, that click's own
+        // `publishRangeTooltip` call (which runs first, lower in the tree,
+        // via `RangeGauge`'s own onClick) would immediately be undone by this
+        // handler closing it right back out in the same event. Only close
+        // when the click landed outside any gauge entirely. `click` (not
+        // `touchstart`) is used so this also closes on mouse clicks (e.g. a
+        // tooltip left open on desktop by a prior tap/click elsewhere).
+        const close = (e: Event) => {
+            const target = e.target as Element | null;
+            if (target?.closest('[data-range-gauge]')) return;
+            setData(null);
+        };
+        document.addEventListener('click', close);
         document.addEventListener('scroll', close, true);
         return () => {
-            document.removeEventListener('touchstart', close);
+            document.removeEventListener('click', close);
             document.removeEventListener('scroll', close, true);
         };
     }, [data]);
 
     if (!data) return null;
-    const { price, low, high, anchor } = data;
+    const { price, low, high, anchor, expirations } = data;
 
     const breachedLow = price <= low;
     const breachedHigh = price >= high;
@@ -235,6 +249,9 @@ function RangeTooltipHost() {
         { label: 'Upper Strike', value: String(high) },
     ];
     if (itmPct != null) rows.push({ label: 'ITM %', value: `${formatItmPct(itmPct)}%` });
+    expirations?.forEach((e) => {
+        rows.push({ label: 'Expiration', value: `${formatDate(e.date)}${e.dte != null ? ` (${e.dte}d)` : ''}` });
+    });
 
     return (
         <div
@@ -248,13 +265,13 @@ function RangeTooltipHost() {
                 transform: 'translate(-50%, -100%)',
                 border: '1px solid var(--color-border)',
                 color: 'var(--color-text-primary)',
-                width: 176,
+                width: 190,
                 pointerEvents: 'none',
             }}
         >
             <div className="flex flex-col gap-0.5">
-                {rows.map((r) => (
-                    <div key={r.label} className="flex items-center justify-between gap-3 tabular-nums whitespace-nowrap leading-tight">
+                {rows.map((r, i) => (
+                    <div key={`${r.label}-${i}`} className="flex items-center justify-between gap-3 tabular-nums whitespace-nowrap leading-tight">
                         <span style={{ color: 'var(--color-text-tertiary)' }}>{r.label}</span>
                         <span className="font-medium">{r.value}</span>
                     </div>
@@ -273,7 +290,21 @@ function RangeTooltipHost() {
  * publishes to the shared `RangeTooltipHost` (see above) rather than
  * rendering its own tooltip, so only one tooltip DOM node ever exists.
  */
-function RangeGauge({ low, high, price }: { low: number; high: number; price: number }) {
+function RangeGauge({
+    low,
+    high,
+    price,
+    width = 110,
+    height = 16,
+    expirations,
+}: {
+    low: number;
+    high: number;
+    price: number;
+    width?: number;
+    height?: number;
+    expirations?: { date: string; dte: number | undefined }[];
+}) {
     const span = high - low;
     const pad = span > 0 ? span * 0.18 : Math.max(1, low * 0.05);
     const trackLow = low - pad;
@@ -289,48 +320,56 @@ function RangeGauge({ low, high, price }: { low: number; high: number; price: nu
     const zone: 'safe' | 'warn' | 'danger' = breached ? 'danger' : distToEdge < 0.15 ? 'warn' : 'safe';
     const dotColor = zone === 'danger' ? 'var(--color-danger)' : zone === 'warn' ? '#d97706' : 'var(--color-success)';
 
+    const trackTop = height / 2 - 3;
+    const tickTop = height / 2 - 6;
+    const dotSize = Math.max(9, height * 0.56);
+
     const publish = (rect: DOMRect) => {
-        publishRangeTooltip({ price, low, high, anchor: { top: rect.top, left: rect.left, width: rect.width } });
+        publishRangeTooltip({ price, low, high, anchor: { top: rect.top, left: rect.left, width: rect.width }, expirations });
     };
     const handleEnter = (e: React.MouseEvent<HTMLSpanElement>) => publish(e.currentTarget.getBoundingClientRect());
     const handleLeave = () => publishRangeTooltip(null);
-    // Touch devices have no hover state — a tap opens the tooltip instead;
-    // `RangeTooltipHost` closes it on the next touch anywhere (including a
-    // second tap on this same gauge) or on scroll. stopPropagation keeps
-    // that same tap from also being read as "outside" by the host's own
-    // touchstart listener, which would otherwise close it in the same event.
-    const handleTouch = (e: React.TouchEvent<HTMLSpanElement>) => {
+    // Touch devices have no hover state — a tap opens the tooltip instead.
+    // `onClick` (not `onTouchStart`) is used because it's what every mobile
+    // browser reliably synthesizes from a tap — `touchstart` alone can be
+    // swallowed by the browser's own scroll/zoom gesture disambiguation on
+    // an element with no other native interactivity. `RangeTooltipHost`
+    // closes it on a click outside any gauge, or on scroll (see the
+    // `data-range-gauge` check there — a click on this same gauge, or a
+    // different one, must not immediately close what it just opened).
+    const handleClick = (e: React.MouseEvent<HTMLSpanElement>) => {
         e.stopPropagation();
         publish(e.currentTarget.getBoundingClientRect());
     };
 
     return (
         <span
+            data-range-gauge=""
             onMouseEnter={handleEnter}
             onMouseLeave={handleLeave}
-            onTouchStart={handleTouch}
-            style={{ position: 'relative', display: 'inline-block', width: 110, height: 16, verticalAlign: 'middle' }}
+            onClick={handleClick}
+            style={{ position: 'relative', display: 'inline-block', width, height, verticalAlign: 'middle', touchAction: 'manipulation' }}
         >
             <span
                 style={{
-                    position: 'absolute', left: 0, right: 0, top: 5, height: 6, borderRadius: 3,
+                    position: 'absolute', left: 0, right: 0, top: trackTop, height: 6, borderRadius: 3,
                     background: 'var(--color-border-light)',
                 }}
             />
             <span
                 style={{
-                    position: 'absolute', top: 5, height: 6, borderRadius: 3,
+                    position: 'absolute', top: trackTop, height: 6, borderRadius: 3,
                     left: `${bandLow * 100}%`,
                     width: `${Math.max(0, bandHigh - bandLow) * 100}%`,
                     opacity: 0.55,
                     background: 'linear-gradient(90deg, var(--color-danger), #d97706 22%, var(--color-success) 45%, var(--color-success) 55%, #d97706 78%, var(--color-danger))',
                 }}
             />
-            <span style={{ position: 'absolute', left: `${bandLow * 100}%`, top: 2, width: 1.5, height: 12, background: 'var(--color-text-tertiary)' }} />
-            <span style={{ position: 'absolute', left: `${bandHigh * 100}%`, top: 2, width: 1.5, height: 12, background: 'var(--color-text-tertiary)', transform: 'translateX(-1.5px)' }} />
+            <span style={{ position: 'absolute', left: `${bandLow * 100}%`, top: tickTop, width: 1.5, height: 12, background: 'var(--color-text-tertiary)' }} />
+            <span style={{ position: 'absolute', left: `${bandHigh * 100}%`, top: tickTop, width: 1.5, height: 12, background: 'var(--color-text-tertiary)', transform: 'translateX(-1.5px)' }} />
             <span
                 style={{
-                    position: 'absolute', left: `${pricePos * 100}%`, top: -1, width: 9, height: 9, marginLeft: -4.5,
+                    position: 'absolute', left: `${pricePos * 100}%`, top: trackTop + 3 - dotSize / 2, width: dotSize, height: dotSize, marginLeft: -dotSize / 2,
                     borderRadius: '50%', background: dotColor, border: '2px solid var(--color-surface)',
                 }}
             />
@@ -577,15 +616,137 @@ const columns: ColumnDef<StrategyTrade>[] = [
     },
 ];
 
+/**
+ * One trade as a mobile card. Leads with the range gauge full-width and
+ * large — per the user's stated usage, that's the thing checked most often
+ * when scanning open positions on a phone — with symbol/strategy/P&L as
+ * secondary at-a-glance info and the rest tucked into a label/value grid.
+ */
+function TradeCard({ trade }: { trade: StrategyTrade }) {
+    const [expanded, setExpanded] = useState(false);
+    const showLegToggle = hasLegDetail(trade);
+    const bounds = trade.status === 'open' && trade.strategy !== 'CALENDAR' && trade.strategy !== 'DIAGONAL'
+        ? innerStrikes(trade.legs, trade.strategy)
+        : null;
+    const showGauge = bounds != null && trade.underlyingPrice != null;
+
+    return (
+        <div
+            className="rounded-xl p-3 flex flex-col gap-2 bg-surface transition-theme"
+            style={{ border: '1px solid var(--color-border)' }}
+        >
+            <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-col min-w-0 gap-0.5">
+                    <span className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-semibold text-base" style={{ color: 'var(--color-text-primary)' }}>
+                            {trade.underlying || '—'}
+                        </span>
+                        <span
+                            className="inline-block px-2 py-0.5 rounded-full text-xs font-medium"
+                            style={{ background: 'var(--color-surface-hover)', color: 'var(--color-text-secondary)' }}
+                        >
+                            {trade.status}
+                        </span>
+                        {trade.status === 'open' && (
+                            <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                                {trade.dte ?? '—'}d left
+                            </span>
+                        )}
+                        {trade.status === 'closed' && (
+                            <span className="text-xs tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
+                                on {formatDate(trade.closedAt)}
+                            </span>
+                        )}
+                    </span>
+                    <span className="text-xs tabular-nums" style={{ color: 'var(--color-text-secondary)' }}>
+                        {trade.contracts != null ? `${trade.contracts} x ` : ''}
+                        {STRATEGY_LABELS[trade.strategy] ?? trade.strategy}
+                        {' '}
+                        {trade.strikes.join(' / ')}
+                    </span>
+                </div>
+                <div className="flex flex-col items-end shrink-0">
+                    <span className="tabular-nums font-semibold text-base" style={{ color: toneColor(trade.pnl) }}>
+                        {trade.pnl == null ? '—' : formatCurrency(trade.pnl, { sign: true })}
+                        {trade.pnlIsEstimate ? <span title="Live mark-to-market estimate">*</span> : null}
+                    </span>
+                    <span className="tabular-nums text-xs" style={{ color: toneColor(trade.pctGain) }}>
+                        {trade.pctGain == null ? '—' : `${trade.pctGain > 0 ? '+' : ''}${trade.pctGain.toFixed(1)}%`}
+                    </span>
+                </div>
+            </div>
+
+            <div className="flex items-center gap-2 py-1">
+                <span className="text-xs tabular-nums shrink-0" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {trade.daysOpen ?? '—'}d opened
+                </span>
+                {showGauge && bounds && (
+                    <div className="flex-1 flex items-center justify-end">
+                        <RangeGauge
+                            low={bounds[0]}
+                            high={bounds[1]}
+                            price={trade.underlyingPrice!}
+                            width={190}
+                            height={22}
+                            expirations={trade.expirations.map((e, i) => ({ date: e, dte: trade.expirationDtes[i] }))}
+                        />
+                    </div>
+                )}
+            </div>
+
+            {showLegToggle && (
+                <button
+                    onClick={() => setExpanded((v) => !v)}
+                    className="inline-flex items-center gap-1 text-xs font-medium self-start"
+                    style={{ color: 'var(--color-primary)' }}
+                >
+                    {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    {expanded ? 'Hide legs' : 'Show legs'}
+                </button>
+            )}
+
+            {expanded &&
+                legDetailRows(trade).map((leg, i) => (
+                    <div
+                        key={i}
+                        className="rounded-lg p-2 flex items-center justify-between gap-2 text-xs"
+                        style={{ background: 'var(--color-surface-hover)' }}
+                    >
+                        <span className="flex items-center gap-1.5">
+                            <span className="font-medium">{leg.strikes[0]}</span>
+                            <span className="uppercase tracking-wide" style={{ color: 'var(--color-text-tertiary)' }}>
+                                {leg.legs[0].right}
+                            </span>
+                            <span style={{ color: 'var(--color-text-tertiary)' }}>{formatDate(leg.expirations[0])}</span>
+                        </span>
+                        <span className="tabular-nums font-medium" style={{ color: toneColor(leg.pnl) }}>
+                            {leg.pnl == null ? '—' : formatCurrency(leg.pnl, { sign: true })}
+                        </span>
+                    </div>
+                ))}
+        </div>
+    );
+}
+
+/** Mobile card list — same data/filters as the table, laid out for narrow screens. */
+function TradeCardList({ trades }: { trades: StrategyTrade[] }) {
+    return (
+        <div className="flex flex-col gap-2">
+            {trades.map((t) => (
+                <TradeCard key={t.id} trade={t} />
+            ))}
+        </div>
+    );
+}
+
 /** Trades table — sortable, filterable, groupable via TanStack Table. */
-export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
+export function TradesTable({ trades, statusFilter }: { trades: StrategyTrade[]; statusFilter: 'all' | 'open' | 'closed' }) {
     const [sorting, setSorting] = useState<SortingState>([
         { id: 'status', desc: false },
         { id: 'openedAt', desc: true },
     ]);
     const [grouping, setGrouping] = useState<GroupingState>([]);
     const [globalFilter, setGlobalFilter] = useState('');
-    const [statusFilter, setStatusFilter] = useState<'all' | 'open' | 'closed'>('all');
     const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
     const [expandedLegRows, setExpandedLegRows] = useState<Set<string>>(new Set());
 
@@ -631,29 +792,19 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
         <div className="flex flex-col gap-3">
             <RangeTooltipHost />
             {/* Toolbar */}
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="hidden sm:flex flex-wrap items-center gap-3">
                 <input
                     type="text"
                     placeholder="Filter by underlying, strike, expiration…"
                     value={globalFilter}
                     onChange={(e) => setGlobalFilter(e.target.value)}
-                    className="rounded-lg px-3 py-2 text-sm bg-surface flex-1 min-w-[220px]"
+                    className="hidden sm:block rounded-lg px-3 py-2 text-base sm:text-sm bg-surface flex-1 min-w-[160px] sm:min-w-[220px]"
                     style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                 />
                 <select
-                    value={statusFilter}
-                    onChange={(e) => setStatusFilter(e.target.value as 'all' | 'open' | 'closed')}
-                    className="rounded-lg px-3 py-2 text-sm bg-surface"
-                    style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
-                >
-                    <option value="all">All statuses</option>
-                    <option value="open">Open</option>
-                    <option value="closed">Closed</option>
-                </select>
-                <select
                     value={grouping[0] ?? 'none'}
                     onChange={(e) => setGrouping(e.target.value === 'none' ? [] : [e.target.value])}
-                    className="rounded-lg px-3 py-2 text-sm bg-surface"
+                    className="hidden sm:block rounded-lg px-3 py-2 text-sm bg-surface"
                     style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                 >
                     {GROUP_OPTIONS.map((g) => (
@@ -662,7 +813,7 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
                         </option>
                     ))}
                 </select>
-                <span className="text-xs ml-auto" style={{ color: 'var(--color-text-tertiary)' }}>
+                <span className="hidden sm:block text-xs ml-auto" style={{ color: 'var(--color-text-tertiary)' }}>
                     {filtered.length} of {trades.length} trades
                 </span>
             </div>
@@ -675,8 +826,13 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
                     No trades match the current filters.
                 </div>
             ) : (
+                <>
+                {/* Mobile: card list, no grouping — the range gauge and key figures take priority over the dense table. */}
+                <div className="sm:hidden">
+                    <TradeCardList trades={table.getSortedRowModel().rows.map((r) => r.original)} />
+                </div>
                 <div
-                    className="rounded-xl bg-surface transition-theme overflow-x-auto"
+                    className="hidden sm:block rounded-xl bg-surface transition-theme overflow-x-auto"
                     style={{ border: '1px solid var(--color-border)' }}
                 >
                     <table className="w-full min-w-max text-sm border-collapse">
@@ -815,6 +971,7 @@ export function TradesTable({ trades }: { trades: StrategyTrade[] }) {
                         </tbody>
                     </table>
                 </div>
+                </>
             )}
         </div>
     );
