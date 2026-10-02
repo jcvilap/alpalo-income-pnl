@@ -43,6 +43,7 @@ const RANGE_PRESETS = [
     { id: '1D', label: '1D', days: 1 },
     { id: '1W', label: '1W', days: 7 },
     { id: '1M', label: '1M', days: 30 },
+    { id: 'MTD', label: 'MTD', days: null },
     { id: '2M', label: '2M', days: 60 },
     { id: '3M', label: '3M', days: 90 },
     { id: '4M', label: '4M', days: 120 },
@@ -52,6 +53,12 @@ const RANGE_PRESETS = [
     { id: 'ALL', label: 'ALL', days: null },
     { id: 'CUSTOM', label: 'Custom', days: null },
 ] as const;
+
+// On mobile only the most-used presets show, to keep the row compact and
+// avoid the strip overflowing its container — the rest stay reachable via
+// "Custom" (which must stay visible here, or mobile users lose any way to
+// pick the hidden 2–6 month / ALL ranges) or by widening the viewport.
+const MOBILE_RANGE_PRESET_IDS = new Set(['1D', '1W', '1M', 'MTD', 'YTD', 'CUSTOM']);
 
 type RangePresetId = (typeof RANGE_PRESETS)[number]['id'];
 
@@ -69,6 +76,12 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
 
     if (preset === 'YTD') {
         return { from: `${now.getFullYear()}-01-01`, to };
+    }
+    if (preset === 'MTD') {
+        // Derive from `to` (already UTC via toISOString) rather than local-time
+        // getters — mixing the two bases can pick different months around a
+        // UTC/local day boundary and yield an inverted from/to range.
+        return { from: `${to.slice(0, 7)}-01`, to };
     }
     if (preset === 'ALL') {
         const from = new Date(now.getTime() - SCHWAB_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
@@ -107,12 +120,16 @@ function readInitialState(searchParams: URLSearchParams) {
     const from = preset === 'CUSTOM' && fromParam ? fromParam : presetRange.from;
     const to = preset === 'CUSTOM' && toParam ? toParam : presetRange.to;
 
+    const statusParam = searchParams.get('status');
+    const status: 'all' | 'open' | 'closed' = statusParam === 'open' || statusParam === 'closed' ? statusParam : 'all';
+
     return {
         preset,
         from,
         to,
         strategies: strategies.length > 0 ? strategies : ['double_calendar'],
         includeUnrealized: searchParams.get('unrealized') === '1',
+        status,
     };
 }
 
@@ -134,6 +151,7 @@ function HomeContent() {
     const [to, setTo] = useState(initial.to);
     const [strategies, setStrategies] = useState<string[]>(initial.strategies);
     const [includeUnrealized, setIncludeUnrealized] = useState(initial.includeUnrealized);
+    const [statusFilter, setStatusFilter] = useState<'all' | 'open' | 'closed'>(initial.status);
     const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
     const strategyMenuRef = useRef<HTMLDivElement>(null);
     const [data, setData] = useState<TradesResponse | null>(null);
@@ -234,8 +252,9 @@ function HomeContent() {
             params.set('to', to);
         }
         if (includeUnrealized) params.set('unrealized', '1');
+        if (statusFilter !== 'all') params.set('status', statusFilter);
         router.replace(`?${params.toString()}`, { scroll: false });
-    }, [router, strategies, preset, from, to, includeUnrealized]);
+    }, [router, strategies, preset, from, to, includeUnrealized, statusFilter]);
 
     useEffect(() => {
         if (!strategyMenuOpen) return;
@@ -279,7 +298,7 @@ function HomeContent() {
     return (
         <LoginGate>
         <main
-            className="min-h-screen px-4 py-6 sm:px-8 sm:py-10 transition-theme"
+            className="min-h-screen px-3 py-4 sm:px-8 sm:py-10 transition-theme"
             style={{ background: 'var(--color-background)' }}
         >
             {loading && (
@@ -297,15 +316,15 @@ function HomeContent() {
                     />
                 </div>
             )}
-            <div className="max-w-6xl mx-auto flex flex-col gap-6">
+            <div className="max-w-6xl mx-auto flex flex-col gap-3 sm:gap-6">
                 {/* Header */}
                 <header className="flex items-start justify-between gap-4 flex-wrap">
                     <div>
-                        <h1 className="text-2xl font-bold flex items-center gap-2" style={{ color: 'var(--color-text-primary)' }}>
+                        <h1 className="text-xl sm:text-2xl font-bold flex items-center gap-2" style={{ color: 'var(--color-text-primary)' }}>
                             <TrendingUp size={22} style={{ color: 'var(--color-primary)' }} />
                             Alpalo Income P&amp;L
                         </h1>
-                        <p className="text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
+                        <p className="hidden sm:block text-sm mt-1" style={{ color: 'var(--color-text-secondary)' }}>
                             Analyze current income generating strategies
                         </p>
                     </div>
@@ -314,15 +333,23 @@ function HomeContent() {
 
                 {/* Filters — one row above the charts */}
                 <section
-                    className="rounded-xl p-4 flex flex-wrap items-end gap-4 bg-surface transition-theme"
+                    className="relative rounded-xl p-3 sm:p-4 flex flex-wrap items-start gap-3 sm:gap-4 bg-surface transition-theme"
                     style={{ border: '1px solid var(--color-border)' }}
                 >
-                    <Field label="Strategy">
-                        <div className="relative" ref={strategyMenuRef}>
+                    {data && (
+                        <span
+                            className="hidden sm:block absolute top-2 right-3 text-xs pointer-events-none"
+                            style={{ color: 'var(--color-text-tertiary)' }}
+                        >
+                            {data.cached ? 'cached' : 'live'} · {data.trades.length} trades
+                        </span>
+                    )}
+                    <Field label="Strategy" className="w-full sm:w-auto">
+                        <div className="relative w-full sm:w-auto" ref={strategyMenuRef}>
                             <button
                                 type="button"
                                 onClick={() => (strategyMenuOpen ? closeStrategyMenu() : setStrategyMenuOpen(true))}
-                                className="rounded-lg px-3 text-sm bg-surface h-9 flex items-center gap-2 min-w-[160px] justify-between"
+                                className="rounded-lg px-3 text-sm bg-surface h-9 flex items-center gap-2 w-full sm:min-w-[160px] justify-between"
                                 style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                             >
                                 <span className="truncate">{strategyLabel}</span>
@@ -330,7 +357,7 @@ function HomeContent() {
                             </button>
                             {strategyMenuOpen && (
                                 <div
-                                    className="absolute z-10 mt-1 rounded-lg p-1.5 bg-surface shadow-lg min-w-[200px]"
+                                    className="absolute z-10 mt-1 rounded-lg p-1.5 bg-surface shadow-lg w-full sm:min-w-[320px] sm:w-auto max-h-[60vh] overflow-y-auto"
                                     style={{ border: '1px solid var(--color-border)' }}
                                 >
                                     <label
@@ -374,7 +401,7 @@ function HomeContent() {
                                                 <button
                                                     type="button"
                                                     onClick={() => selectOnlyStrategy(s.id)}
-                                                    className="shrink-0 text-xs font-medium opacity-0 group-hover:opacity-100 hover:underline"
+                                                    className="shrink-0 text-xs font-medium opacity-100 sm:opacity-0 sm:group-hover:opacity-100 hover:underline"
                                                     style={{ color: 'var(--color-primary)' }}
                                                 >
                                                     Only
@@ -386,13 +413,34 @@ function HomeContent() {
                             )}
                         </div>
                     </Field>
+                    <Field label="Status" className="shrink-0">
+                        <div className="relative w-auto">
+                            <select
+                                value={statusFilter}
+                                onChange={(e) => setStatusFilter(e.target.value as 'all' | 'open' | 'closed')}
+                                className="appearance-none rounded-lg pl-3 pr-8 text-sm bg-surface h-9 w-auto sm:min-w-[160px]"
+                                style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
+                            >
+                                <option value="all">All statuses</option>
+                                <option value="open">Open</option>
+                                <option value="closed">Closed</option>
+                            </select>
+                            <ChevronDown
+                                size={14}
+                                className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2"
+                                style={{ color: 'var(--color-text-tertiary)' }}
+                            />
+                        </div>
+                    </Field>
                     <Field label="Range">
-                        <div className="flex flex-wrap gap-1">
+                        <div className="flex flex-wrap gap-1 max-w-full sm:max-w-[360px]">
                             {RANGE_PRESETS.map((p) => (
                                 <button
                                     key={p.id}
                                     onClick={() => selectPreset(p.id)}
-                                    className="rounded-lg px-2.5 text-xs font-medium transition-theme h-9"
+                                    className={`rounded-lg px-1.5 sm:px-2.5 text-xs font-medium transition-theme h-9 shrink-0 ${
+                                        MOBILE_RANGE_PRESET_IDS.has(p.id) ? '' : 'hidden sm:inline-flex sm:items-center'
+                                    }`}
                                     style={
                                         preset === p.id
                                             ? { background: 'var(--color-primary)', color: 'white' }
@@ -418,24 +466,14 @@ function HomeContent() {
                             <button
                                 onClick={() => load(false)}
                                 disabled={loading}
-                                className="rounded-lg px-4 text-sm font-medium text-white bg-gradient-button hover:bg-gradient-button-hover disabled:opacity-60 h-9"
+                                className="rounded-lg px-4 text-sm font-medium text-white bg-gradient-button hover:bg-gradient-button-hover disabled:opacity-60 h-9 sm:mt-5"
                             >
                                 {loading ? 'Loading…' : 'Apply'}
                             </button>
                         </>
                     )}
-                    <button
-                        onClick={() => load(true)}
-                        disabled={loading}
-                        title="Bypass cache and re-fetch from Schwab"
-                        className="rounded-lg px-3 text-sm font-medium flex items-center gap-1.5 disabled:opacity-60 h-9"
-                        style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
-                    >
-                        <RefreshCw size={14} className={loading ? 'animate-spin-slow' : ''} />
-                        Refresh
-                    </button>
                     <label
-                        className="flex items-center gap-2 text-sm cursor-pointer h-9 px-1"
+                        className="flex items-center gap-2 text-sm cursor-pointer h-9 px-1 sm:mt-5"
                         style={{ color: 'var(--color-text-secondary)' }}
                         title="Blend live mark-to-market P&L from open trades into the totals below"
                     >
@@ -446,11 +484,16 @@ function HomeContent() {
                         />
                         Include unrealized P&amp;L
                     </label>
-                    {data && (
-                        <span className="text-xs ml-auto self-center" style={{ color: 'var(--color-text-tertiary)' }}>
-                            {data.cached ? 'cached' : 'live'} · {data.trades.length} trades
-                        </span>
-                    )}
+                    <button
+                        onClick={() => load(true)}
+                        disabled={loading}
+                        title="Bypass cache and re-fetch from Schwab"
+                        className="rounded-lg px-3 text-sm font-medium flex items-center gap-1.5 disabled:opacity-60 h-9 sm:mt-5"
+                        style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+                    >
+                        <RefreshCw size={14} className={loading ? 'animate-spin-slow' : ''} />
+                        Refresh
+                    </button>
                 </section>
 
                 {error && (
@@ -482,30 +525,38 @@ function HomeContent() {
                             value={`${m.closedTrades} / ${m.openTrades}`}
                             hint={`avg hold ${formatNumber(m.avgHoldDays, 0)}d`}
                         />
-                        <StatTile
-                            label="Avg Win"
-                            value={formatCurrency(m.avgWin, { sign: true })}
-                            hint={`${formatSignedPercent(m.avgWinPct)}`}
-                            tone="positive"
-                        />
-                        <StatTile
-                            label="Avg Loss"
-                            value={formatCurrency(m.avgLoss, { sign: true })}
-                            hint={`${formatSignedPercent(m.avgLossPct)}`}
-                            tone="negative"
-                        />
-                        <StatTile
-                            label="Biggest Win"
-                            value={formatCurrency(m.bestTrade, { sign: true })}
-                            hint={`${formatSignedPercent(m.bestTradePct)}`}
-                            tone="positive"
-                        />
-                        <StatTile
-                            label="Biggest Loss"
-                            value={formatCurrency(m.worstTrade, { sign: true })}
-                            hint={`${formatSignedPercent(m.worstTradePct)}`}
-                            tone="negative"
-                        />
+                        <div className="hidden sm:block">
+                            <StatTile
+                                label="Avg Win"
+                                value={formatCurrency(m.avgWin, { sign: true })}
+                                hint={`${formatSignedPercent(m.avgWinPct)}`}
+                                tone="positive"
+                            />
+                        </div>
+                        <div className="hidden sm:block">
+                            <StatTile
+                                label="Avg Loss"
+                                value={formatCurrency(m.avgLoss, { sign: true })}
+                                hint={`${formatSignedPercent(m.avgLossPct)}`}
+                                tone="negative"
+                            />
+                        </div>
+                        <div className="hidden sm:block">
+                            <StatTile
+                                label="Biggest Win"
+                                value={formatCurrency(m.bestTrade, { sign: true })}
+                                hint={`${formatSignedPercent(m.bestTradePct)}`}
+                                tone="positive"
+                            />
+                        </div>
+                        <div className="hidden sm:block">
+                            <StatTile
+                                label="Biggest Loss"
+                                value={formatCurrency(m.worstTrade, { sign: true })}
+                                hint={`${formatSignedPercent(m.worstTradePct)}`}
+                                tone="negative"
+                            />
+                        </div>
                     </section>
                 )}
 
@@ -513,7 +564,7 @@ function HomeContent() {
                 {data && <EquityCurve data={data.equityCurve} />}
 
                 {/* Table */}
-                {data && <TradesTable trades={data.trades} />}
+                {data && <TradesTable trades={data.trades} statusFilter={statusFilter} />}
 
                 {!data && !error && !loading && (
                     <div className="text-center text-sm py-12" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -526,10 +577,10 @@ function HomeContent() {
     );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
     return (
-        <label className="flex flex-col gap-1">
-            <span className="text-xs font-medium uppercase tracking-wide" style={{ color: 'var(--color-text-secondary)' }}>
+        <label className={`flex flex-col gap-1 min-w-0 ${className ?? ''}`}>
+            <span className="hidden sm:block text-xs font-medium uppercase tracking-wide" style={{ color: 'var(--color-text-secondary)' }}>
                 {label}
             </span>
             {children}

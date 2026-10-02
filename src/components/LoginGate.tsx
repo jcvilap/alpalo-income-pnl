@@ -77,13 +77,15 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
                     <input
                         type="text"
                         autoFocus
+                        autoCapitalize="none"
+                        autoCorrect="off"
                         placeholder="Username"
                         value={username}
                         onChange={(e) => {
                             setUsername(e.target.value);
                             setError(false);
                         }}
-                        className="rounded-lg px-3 py-2 text-sm bg-surface"
+                        className="rounded-lg px-3 py-3 text-base bg-surface"
                         style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                     />
                     <input
@@ -94,7 +96,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
                             setPassword(e.target.value);
                             setError(false);
                         }}
-                        className="rounded-lg px-3 py-2 text-sm bg-surface"
+                        className="rounded-lg px-3 py-3 text-base bg-surface"
                         style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                     />
                 </div>
@@ -107,7 +109,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
 
                 <button
                     type="submit"
-                    className="rounded-lg px-4 py-2 text-sm font-medium text-white bg-gradient-button hover:bg-gradient-button-hover"
+                    className="rounded-lg px-4 py-3 text-base font-medium text-white bg-gradient-button hover:bg-gradient-button-hover"
                 >
                     Sign in
                 </button>

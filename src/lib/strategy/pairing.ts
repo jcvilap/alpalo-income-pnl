@@ -584,6 +584,13 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
             let remainingToClose = matchContracts(match) ?? 1;
             const totalCloseContracts = remainingToClose;
             const q = openQueues.get(match.signature) ?? [];
+            // Running count of contracts this close has consumed so far across
+            // the while-loop below — NOT `lot.totalContracts -
+            // lot.remainingContracts`, which resets to 0 for every fresh lot
+            // and would collide (same id) if this close order fully drains more
+            // than one lot of the same signature (e.g. a position reopened and
+            // closed again, closed by a second order sharing the same orderId).
+            let closeConsumedSoFar = 0;
 
             while (remainingToClose > 0 && q.length > 0) {
                 const lot = q[0];
@@ -607,7 +614,16 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                 const pnl = openShare + closeShare;
                 const daysOpen = safeHoldDays(lot.match.order.time, match.order.time);
                 trades.push({
-                    id: `${lot.match.order.orderId}-${match.order.orderId}-${lot.totalContracts - lot.remainingContracts}`,
+                    // `closeConsumedSoFar` (not `lot.totalContracts -
+                    // lot.remainingContracts`, which resets per fresh lot)
+                    // disambiguates multiple lots the same close order drains.
+                    // `match.signature` disambiguates a close *order* that
+                    // independently matches more than one leg-set under
+                    // classifyOrder's per-leg fallback (e.g. one batched order
+                    // closing two separate same-day LEAPS positions) — those
+                    // each start their own while-loop at closeConsumedSoFar=0,
+                    // so the counter alone can't tell them apart.
+                    id: `${lot.match.order.orderId}-${match.order.orderId}-${match.signature}-${closeConsumedSoFar}`,
                     strategy: lot.match.strategy,
                     underlying: lot.match.order.underlying,
                     status: 'closed',
@@ -626,6 +642,7 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
 
                 lot.remainingContracts -= consumed;
                 remainingToClose -= consumed;
+                closeConsumedSoFar += consumed;
                 // Keep the lot's remaining cost basis in sync with the contracts
                 // actually left — otherwise a partially-closed multi-contract
                 // strangle lot would still report its *original* full-size
