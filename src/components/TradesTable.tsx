@@ -698,6 +698,24 @@ function legDetailRows(trade: StrategyTrade): StrategyTrade[] {
 function buildColumns(onCancelled: () => void): ColumnDef<StrategyTrade>[] {
     return [
     {
+        id: 'rowNumber',
+        header: '#',
+        // The actual number is rendered from the row loop's own `.map()`
+        // index in the table body below, not here — TanStack never
+        // reassigns `row.index` when sorting reorders the display, so it
+        // always reflects the row's position in the unsorted core row
+        // model, not where it actually appears on screen (see the
+        // `isRowNumberCell` special-case in the render loop). This default
+        // only covers the per-leg detail sub-rows (`legDetailRows`), which
+        // intentionally render blank — a leg row isn't itself a numbered
+        // position in the table.
+        cell: () => null,
+        aggregatedCell: () => null,
+        enableSorting: false,
+        enableGrouping: false,
+        size: 40,
+    },
+    {
         accessorKey: 'underlying',
         header: 'Symbol',
         cell: (ctx) => <span className="font-medium">{ctx.getValue<string>() || '—'}</span>,
@@ -1192,7 +1210,7 @@ export function TradesTable({ trades, statusFilter, onTradesChanged }: { trades:
                             ))}
                         </thead>
                         <tbody>
-                            {table.getRowModel().rows.map((row) => {
+                            {table.getRowModel().rows.map((row, displayIndex) => {
                                 const showLegToggle = !row.getIsGrouped() && hasLegDetail(row.original);
                                 const legRowExpanded = showLegToggle && expandedLegRows.has(row.id);
                                 return (
@@ -1208,6 +1226,7 @@ export function TradesTable({ trades, statusFilter, onTradesChanged }: { trades:
                                                 const numeric = !NON_NUMERIC_COLUMNS.has(cell.column.id);
                                                 const pinnedSide = cell.column.getIsPinned();
                                                 const isUnderlyingCell = cell.column.id === 'underlying';
+                                                const isRowNumberCell = cell.column.id === 'rowNumber';
                                                 return (
                                                     <td
                                                         key={cell.id}
@@ -1217,7 +1236,17 @@ export function TradesTable({ trades, statusFilter, onTradesChanged }: { trades:
                                                             ...pinnedStyle(pinnedSide, pinnedSide === 'right' ? cell.column.getAfter('right') : cell.column.getStart('left'), row.getIsGrouped()),
                                                         }}
                                                     >
-                                                        {cell.getIsGrouped() ? (
+                                                        {isRowNumberCell ? (
+                                                            // `row.index` is the row's position in the unsorted core row
+                                                            // model, not its current display position — TanStack never
+                                                            // reassigns it when sorting reorders the array — so it can't
+                                                            // be read from the cell context here. `displayIndex` (this
+                                                            // row's position in the already-sorted/filtered array this
+                                                            // very `.map()` is iterating) is the actual on-screen position.
+                                                            <span className="tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
+                                                                {displayIndex + 1}
+                                                            </span>
+                                                        ) : cell.getIsGrouped() ? (
                                                             <button
                                                                 onClick={row.getToggleExpandedHandler()}
                                                                 className="inline-flex items-center gap-1 font-semibold cursor-pointer"
