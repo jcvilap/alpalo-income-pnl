@@ -167,7 +167,7 @@ function HomeContent() {
     const loadRequestRef = useRef(0);
 
     const load = useCallback(
-        async (refresh = false, overrideFrom?: string, overrideTo?: string, overrideStrategies?: string[]) => {
+        async (refresh = false, overrideFrom?: string, overrideTo?: string, overrideStrategies?: string[], overrideStatus?: 'all' | 'open' | 'closed') => {
             const requestId = ++loadRequestRef.current;
             setLoading(true);
             setError(null);
@@ -176,6 +176,7 @@ function HomeContent() {
                     from: overrideFrom ?? from,
                     to: overrideTo ?? to,
                     strategy: (overrideStrategies ?? strategies).join(','),
+                    status: overrideStatus ?? statusFilter,
                 });
                 if (refresh) params.set('refresh', 'true');
                 const res = await fetch(`/api/trades?${params.toString()}`);
@@ -191,7 +192,7 @@ function HomeContent() {
                 if (requestId === loadRequestRef.current) setLoading(false);
             }
         },
-        [from, to, strategies],
+        [from, to, strategies, statusFilter],
     );
 
     useEffect(() => {
@@ -417,7 +418,11 @@ function HomeContent() {
                         <div className="relative w-auto">
                             <select
                                 value={statusFilter}
-                                onChange={(e) => setStatusFilter(e.target.value as 'all' | 'open' | 'closed')}
+                                onChange={(e) => {
+                                    const next = e.target.value as 'all' | 'open' | 'closed';
+                                    setStatusFilter(next);
+                                    void load(false, from, to, strategies, next);
+                                }}
                                 className="appearance-none rounded-lg pl-3 pr-8 text-sm bg-surface h-9 w-auto sm:min-w-[160px]"
                                 style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}
                             >

@@ -37,6 +37,8 @@ export async function GET(request: Request) {
         const url = new URL(request.url);
         const strategies = parseStrategies(url.searchParams.get('strategy'));
         const refresh = url.searchParams.get('refresh') === 'true';
+        const statusParam = url.searchParams.get('status');
+        const status: 'all' | 'open' | 'closed' = statusParam === 'open' || statusParam === 'closed' ? statusParam : 'all';
 
         const now = new Date();
         const defaultFrom = `${now.getUTCFullYear()}-01-01`;
@@ -45,7 +47,7 @@ export async function GET(request: Request) {
         const from = toIso(url.searchParams.get('from') ?? defaultFrom);
         const to = toIso(url.searchParams.get('to') ?? defaultTo, true);
 
-        const result = await getTrades({ from, to, strategies, refresh });
+        const result = await getTrades({ from, to, strategies, refresh, status });
         return NextResponse.json(result);
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);

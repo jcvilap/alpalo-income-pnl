@@ -1,12 +1,12 @@
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import type { RedisClientType } from 'redis';
 import { getConfiguredAccounts, BrokerType, type AccountConfig } from '@/config/accounts';
-import { SchwabClient, type SchwabQuote, type SchwabTransaction } from '@/live/schwabClient';
+import { SchwabClient, type SchwabQuote, type SchwabTransaction, type SchwabWorkingOrder, type SchwabWorkingOrderLeg } from '@/live/schwabClient';
 import { withRedis } from '@/lib/redis';
 import { normalizeToOrderGroups } from '@/lib/strategy/normalize';
 import { buildTrades, safeHoldDays, tracksLegDetail } from '@/lib/strategy/pairing';
 import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
-import type { StrategyId, StrategyMetrics, StrategyTrade } from '@/lib/strategy/types';
+import type { OptionRight, StrategyId, StrategyMetrics, StrategyTrade, WorkingCloseOrder } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
 const STRATEGY_VERSION = 'v32';
@@ -173,6 +173,7 @@ export async function getTrades(opts: {
     to: string;
     strategies?: StrategyId[];
     refresh?: boolean;
+    status?: 'all' | 'open' | 'closed';
 }): Promise<TradesResult> {
     const strategies: StrategyId[] = opts.strategies && opts.strategies.length > 0 ? opts.strategies : ['DOUBLE_CALENDAR'];
     const strategySet = new Set(strategies);
@@ -251,10 +252,22 @@ export async function getTrades(opts: {
         // it's recomputed fresh on every request regardless of cache status.
         applyRemainingDte(allTrades);
 
+        // Working close orders are live broker state, not transaction
+        // history — never cached in the parsed-trade entry, re-fetched fresh
+        // on every request like the live quotes above.
+        await attachWorkingCloseOrders(allTrades, account, redis);
+
         // Only show trades whose open or close actually falls in the user's
         // requested range — the wider fetch above exists purely to resolve
         // cost basis, not to change what's displayed.
-        const trades = allTrades.filter(t => tradeInRange(t, opts.from, opts.to));
+        const inRangeTrades = allTrades.filter(t => tradeInRange(t, opts.from, opts.to));
+
+        // Apply the status filter server-side so tiles/metrics and the trade
+        // list stay consistent — a client-side-only filter would leave the
+        // other (filtered-out) status's numbers baked into the aggregates.
+        const trades = opts.status && opts.status !== 'all'
+            ? inRangeTrades.filter(t => t.status === opts.status)
+            : inRangeTrades;
 
         const metrics = computeMetrics(strategies, trades);
         const equityCurve = cumulativePnlSeries(trades);
@@ -639,6 +652,173 @@ function applyRemainingDte(trades: StrategyTrade[]): void {
         } catch {
             trade.dte = undefined;
         }
+    }
+}
+
+const WORKING_ORDER_STATUSES = new Set(['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED']);
+const CLOSING_INSTRUCTIONS = new Set(['BUY_TO_CLOSE', 'SELL_TO_CLOSE']);
+const OPTION_MULTIPLIER = 100;
+
+/**
+ * Decode a Schwab/OCC-format option symbol, e.g. "SPX   251016P07600000"
+ * (6-char root padded with spaces, YYMMDD, C/P, 8-digit strike in
+ * thousandths). The `/orders` endpoint's `orderLegCollection[].instrument`
+ * only reliably populates `symbol`/`assetType` — unlike the `/transactions`
+ * endpoint, it does NOT pre-decompose `putCall`/`strikePrice`/
+ * `expirationDate`/`underlyingSymbol` — so working-order legs must be parsed
+ * from this string rather than read off those (absent) structured fields.
+ */
+function parseOccSymbol(symbol: string): { underlying: string; expiration: string; right: OptionRight; strike: number } | null {
+    const compact = symbol.replace(/\s+/g, ' ').trim();
+    const match = /^(\S+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(compact);
+    if (!match) return null;
+    const [, underlying, yy, mm, dd, cp, strikeRaw] = match;
+    return {
+        underlying,
+        expiration: `20${yy}-${mm}-${dd}`,
+        right: cp === 'C' ? 'CALL' : 'PUT',
+        strike: Number(strikeRaw) / 1000,
+    };
+}
+
+/**
+ * Find, for each open trade, a still-working broker order whose legs exactly
+ * match the trade's open legs (by right/strike/expiration) with
+ * closing instructions — i.e. an order that would close this exact
+ * position if it fills — and attach a `WorkingCloseOrder` summary.
+ *
+ * Matched by leg identity rather than order id: a closing order is a brand
+ * new Schwab order unrelated to `openOrderId`/`closeOrderId` (those only
+ * exist once a close has actually filled).
+ */
+async function attachWorkingCloseOrders(
+    trades: StrategyTrade[],
+    account: AccountConfig,
+    redis: RedisClientType,
+): Promise<void> {
+    const openTrades = trades.filter(t => t.status === 'open');
+    if (openTrades.length === 0) return;
+
+    const client = new SchwabClient({
+        name: account.name,
+        clientId: account.key,
+        clientSecret: account.secret,
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken,
+        accountHash: account.accountIdKey,
+        redis,
+    });
+
+    // A still-pending GTC closing order comes back from Schwab tagged
+    // `PENDING_ACTIVATION`, not `WORKING` — thinkorswim's UI labels every
+    // not-yet-filled order "WORKING" regardless of the underlying API status,
+    // which is a separate, real status this account's orders just never seem
+    // to land in. Fetch each status Schwab might actually use for a pending
+    // order server-side (cheaper than pulling 60+ days of filled/canceled
+    // history and filtering client-side) and merge the results.
+    let orders: SchwabWorkingOrder[];
+    try {
+        const batches = await Promise.all(
+            Array.from(WORKING_ORDER_STATUSES).map(status => client.getOrders({ status })),
+        );
+        orders = batches.flat();
+    } catch (e) {
+        console.warn('Failed to fetch working orders:', e);
+        return;
+    }
+
+    const workingOrders = orders.filter(o => WORKING_ORDER_STATUSES.has(o.status));
+
+    // Decode each working order's closing option legs once (OCC symbol ->
+    // right/strike/expiration/underlying), skipping orders whose symbols
+    // don't parse rather than letting one bad leg sink the whole match.
+    const decoded = workingOrders.map(order => {
+        const legs = (order.orderLegCollection ?? [])
+            .filter(l => CLOSING_INSTRUCTIONS.has(l.instruction) && l.instrument.assetType === 'OPTION' && l.instrument.symbol)
+            .map(l => {
+                const parsed = parseOccSymbol(l.instrument.symbol!);
+                return parsed ? { raw: l, parsed } : null;
+            })
+            .filter((l): l is { raw: SchwabWorkingOrderLeg; parsed: NonNullable<ReturnType<typeof parseOccSymbol>> } => l != null);
+        return { order, legs };
+    });
+
+    for (const trade of openTrades) {
+        const openLegs = trade.legs.filter(l => l.openClose === 'OPEN');
+        if (openLegs.length === 0) continue;
+        // Include `underlying` in the key — two different underlyings can
+        // otherwise share the same right/strike/expiration (e.g. two
+        // single-leg LEAPS positions at the same strike/expiry on different
+        // symbols), which would wrongly let one's working order match the
+        // other's trade.
+        const legKey = (l: { underlying: string; right: string; strike: number; expiration: string }) =>
+            `${l.underlying}|${l.right}|${l.strike}|${l.expiration}`;
+        // Require the order leg's quantity to match the trade leg's own
+        // remaining open quantity — a partial close (e.g. 2 contracts closing
+        // out of a 5-contract position) must not be treated as if it closed
+        // the whole trade; only an order whose every leg exactly covers the
+        // full remaining position counts as "this order closes this trade".
+        const tradeLegQuantities = new Map(openLegs.map(l => [legKey(l), Math.abs(l.quantity)]));
+
+        const match = decoded.find(({ legs }) => {
+            if (legs.length !== tradeLegQuantities.size) return false;
+            const seen = new Set<string>();
+            for (const l of legs) {
+                const key = legKey(l.parsed);
+                const expectedQty = tradeLegQuantities.get(key);
+                if (expectedQty == null || expectedQty !== l.raw.quantity) return false;
+                seen.add(key);
+            }
+            return seen.size === tradeLegQuantities.size;
+        });
+        if (!match) continue;
+
+        // Net cash the order would generate if it fills. Schwab's `price` on
+        // a multi-leg order is a per-spread magnitude — `order.quantity` is
+        // the number of spreads (not `trade.contracts`, which is the largest
+        // *leg* quantity and can overstate spread count on a ratio spread
+        // like a 1:2:1 butterfly) — so total cash is price × order quantity.
+        // Direction comes from `orderType` (NET_CREDIT/NET_DEBIT) when
+        // present; a single-leg order has no `orderType` combo label, so fall
+        // back to that leg's own BUY_TO_CLOSE (debit) / SELL_TO_CLOSE
+        // (credit) instruction instead of assuming every non-NET_DEBIT order
+        // is a credit.
+        const spreadQuantity = match.order.quantity ?? match.legs[0]?.raw.quantity ?? 1;
+        const magnitude = (match.order.price ?? 0) * spreadQuantity * OPTION_MULTIPLIER;
+        let closeValue: number;
+        if (match.order.orderType === 'NET_DEBIT') {
+            closeValue = -magnitude;
+        } else if (match.order.orderType === 'NET_CREDIT') {
+            closeValue = magnitude;
+        } else if (match.legs.length === 1) {
+            closeValue = match.legs[0].raw.instruction === 'SELL_TO_CLOSE' ? magnitude : -magnitude;
+        } else {
+            // Multi-leg order with no explicit NET_CREDIT/NET_DEBIT label —
+            // no reliable way to infer direction, so skip rather than risk
+            // showing P&L with the wrong sign.
+            continue;
+        }
+
+        const estPnl = trade.openNet + closeValue;
+        const estPctGain = trade.openNet !== 0 ? (estPnl / Math.abs(trade.openNet)) * 100 : undefined;
+
+        const workingCloseOrder: WorkingCloseOrder = {
+            orderId: String(match.order.orderId),
+            price: match.order.price,
+            orderType: match.order.orderType,
+            duration: match.order.duration,
+            enteredTime: match.order.enteredTime,
+            legs: match.legs.map(l => ({
+                instruction: l.raw.instruction,
+                right: l.parsed.right,
+                strike: l.parsed.strike,
+                expiration: l.parsed.expiration,
+                underlying: l.parsed.underlying,
+            })),
+            estPnl,
+            estPctGain: estPctGain ?? 0,
+        };
+        trade.workingCloseOrder = workingCloseOrder;
     }
 }
 

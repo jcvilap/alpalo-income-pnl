@@ -147,6 +147,34 @@ export interface SchwabTransaction {
     description?: string;
 }
 
+/**
+ * A single leg's instrument + instruction within a working order returned by
+ * GET /orders. Unlike the `/transactions` endpoint's instrument shape (see
+ * `SchwabTransactionInstrument`), `/orders` only reliably populates
+ * `symbol`/`assetType` here — `putCall`/`strikePrice`/`expirationDate`/
+ * `underlyingSymbol` come back empty, so callers must decode the OCC
+ * `symbol` string themselves (see `parseOccSymbol` in transactions/service.ts).
+ */
+export interface SchwabWorkingOrderLeg {
+    instruction: 'BUY_TO_OPEN' | 'SELL_TO_OPEN' | 'BUY_TO_CLOSE' | 'SELL_TO_CLOSE' | 'BUY' | 'SELL';
+    quantity: number;
+    instrument: SchwabTransactionInstrument;
+}
+
+/** A working/pending order as returned by GET /accounts/{hash}/orders. */
+export interface SchwabWorkingOrder {
+    orderId: number;
+    status: string;
+    quantity?: number;
+    filledQuantity?: number;
+    price?: number;
+    orderType?: string;
+    complexOrderStrategyType?: string;
+    duration?: string;
+    enteredTime?: string;
+    orderLegCollection?: SchwabWorkingOrderLeg[];
+}
+
 export interface SchwabOrderLeg {
     instruction: 'BUY' | 'SELL' | 'BUY_TO_COVER' | 'SELL_SHORT';
     quantity: number;
@@ -578,6 +606,28 @@ export class SchwabClient {
         // The API returns 201 with a Location header; no JSON body
         await this.request<undefined>('POST', `${TRADER_BASE}/accounts/${hash}/orders`, { body: order });
         return null; // Order ID would require parsing Location header, which fetch doesn't expose easily
+    }
+
+    /**
+     * Fetch working (pending) orders for the configured account.
+     * Schwab requires `fromEnteredTime`/`toEnteredTime` even for status-only
+     * filtering — defaults to a lookback wide enough to cover any order
+     * entered in the last 60 days, which comfortably covers GTC closing
+     * orders placed well before they're checked.
+     */
+    async getOrders(opts?: { status?: string; fromEnteredTime?: string; toEnteredTime?: string }): Promise<SchwabWorkingOrder[]> {
+        const hash = await this.resolveAccountHash();
+        const now = new Date();
+        const toEnteredTime = opts?.toEnteredTime ?? now.toISOString();
+        const fromEnteredTime = opts?.fromEnteredTime ?? new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
+        const params: Record<string, string> = { fromEnteredTime, toEnteredTime };
+        if (opts?.status) params.status = opts.status;
+
+        return this.request<SchwabWorkingOrder[]>(
+            'GET',
+            `${TRADER_BASE}/accounts/${hash}/orders`,
+            { params }
+        );
     }
 
     // ---------------------------------------------------------------------------
