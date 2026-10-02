@@ -5,8 +5,8 @@ import { Lock } from 'lucide-react';
 
 const SESSION_KEY = 'alpalo-income-pnl:authed';
 const PASSWORD_KEY = 'alpalo-income-pnl:password';
-const USERNAME = 'admin';
-const PASSWORD = '123';
+const USERNAME = 'jcvilap';
+const PASSWORD = '123Qwert!';
 
 /**
  * Lightweight client-side speed bump, not real authentication — the
