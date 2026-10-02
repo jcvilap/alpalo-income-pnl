@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { OptionRight, StrategyId, StrategyMetrics, StrategyTrade, WorkingCloseOrder } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v32';
+const STRATEGY_VERSION = 'v33';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -63,7 +63,7 @@ export interface TradesResult {
     fetchedAt: string;
 }
 
-function firstSchwabAccount(): AccountConfig {
+export function firstSchwabAccount(): AccountConfig {
     const accounts = getConfiguredAccounts();
     const schwab = accounts.find(a => a.broker === BrokerType.SCHWAB);
     if (!schwab) {

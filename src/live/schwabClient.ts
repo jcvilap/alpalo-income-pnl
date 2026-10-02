@@ -505,19 +505,17 @@ export class SchwabClient {
                 body: options?.body ? JSON.stringify(options.body) : undefined
             });
 
-            if (retry.status === 201 || retry.status === 204) {
-                return undefined as T;
-            }
             if (!retry.ok) {
                 const body = await retry.text();
                 throw new SchwabError(`Schwab request failed after retry (${retry.status})`, retry.status, body);
             }
-            return retry.json();
-        }
-
-        // 201 Created (order placement) — no response body
-        if (response.status === 201 || response.status === 204) {
-            return undefined as T;
+            // 201 (order placement) and 204 (no content) never carry a body;
+            // some endpoints (e.g. cancel-order) also return 200 with an
+            // empty body — reading an empty body as text first, rather than
+            // always calling .json(), avoids throwing on those.
+            if (retry.status === 201 || retry.status === 204) return undefined as T;
+            const retryText = await retry.text();
+            return retryText ? JSON.parse(retryText) : (undefined as T);
         }
 
         if (!response.ok) {
@@ -525,7 +523,12 @@ export class SchwabClient {
             throw new SchwabError(`Schwab request failed (${response.status}): ${response.statusText}`, response.status, body);
         }
 
-        return response.json();
+        // See the retry branch above for why 201/204 short-circuit and why
+        // the success path otherwise text-then-parses instead of always
+        // calling .json() directly.
+        if (response.status === 201 || response.status === 204) return undefined as T;
+        const text = await response.text();
+        return text ? JSON.parse(text) : (undefined as T);
     }
 
     private async ensureAuthenticated(): Promise<void> {
@@ -606,6 +609,15 @@ export class SchwabClient {
         // The API returns 201 with a Location header; no JSON body
         await this.request<undefined>('POST', `${TRADER_BASE}/accounts/${hash}/orders`, { body: order });
         return null; // Order ID would require parsing Location header, which fetch doesn't expose easily
+    }
+
+    /**
+     * Cancel a working (not-yet-filled) order for the configured account.
+     * Schwab returns 200/201/204 with no body on success.
+     */
+    async cancelOrder(orderId: string): Promise<void> {
+        const hash = await this.resolveAccountHash();
+        await this.request<undefined>('DELETE', `${TRADER_BASE}/accounts/${hash}/orders/${orderId}`);
     }
 
     /**
