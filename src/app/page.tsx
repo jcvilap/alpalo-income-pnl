@@ -56,8 +56,9 @@ const RANGE_PRESETS = [
 
 // On mobile only the most-used presets show, to keep the row compact and
 // avoid the strip overflowing its container — the rest stay reachable via
-// "Custom" or by widening the viewport.
-const MOBILE_RANGE_PRESET_IDS = new Set(['1D', '1W', '1M', 'MTD', 'YTD']);
+// "Custom" (which must stay visible here, or mobile users lose any way to
+// pick the hidden 2–6 month / ALL ranges) or by widening the viewport.
+const MOBILE_RANGE_PRESET_IDS = new Set(['1D', '1W', '1M', 'MTD', 'YTD', 'CUSTOM']);
 
 type RangePresetId = (typeof RANGE_PRESETS)[number]['id'];
 
@@ -77,7 +78,10 @@ function rangeForPreset(preset: RangePresetId): { from: string; to: string } {
         return { from: `${now.getFullYear()}-01-01`, to };
     }
     if (preset === 'MTD') {
-        return { from: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`, to };
+        // Derive from `to` (already UTC via toISOString) rather than local-time
+        // getters — mixing the two bases can pick different months around a
+        // UTC/local day boundary and yield an inverted from/to range.
+        return { from: `${to.slice(0, 7)}-01`, to };
     }
     if (preset === 'ALL') {
         const from = new Date(now.getTime() - SCHWAB_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
