@@ -1,11 +1,12 @@
 /** Shared display formatters for the dashboard. */
 
-export function formatCurrency(value: number, opts?: { sign?: boolean }): string {
+export function formatCurrency(value: number, opts?: { sign?: boolean; decimals?: number }): string {
+    const decimals = opts?.decimals ?? 2;
     const formatted = new Intl.NumberFormat('en-US', {
         style: 'currency',
         currency: 'USD',
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
     }).format(Math.abs(value));
     if (opts?.sign) {
         if (value > 0) return `+${formatted}`;

@@ -430,9 +430,9 @@ function CloseOrderCell({ order }: { order: WorkingCloseOrder }) {
             className="tabular-nums cursor-default"
             style={{ touchAction: 'manipulation' }}
         >
-            closing @
+            <span className="text-xs">closing @</span>
             <span className="text-xs" style={{ color }}>
-                {order.estPctGain.toFixed(0)}% ({formatCurrency(order.estPnl)})
+                {order.estPctGain.toFixed(0)}% ({formatCurrency(order.estPnl, { decimals: 0 })})
             </span>
         </span>
     );
