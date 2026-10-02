@@ -86,9 +86,10 @@ backfills it on load so `getRefreshTokenRemainingDays()` doesn't misreport
 ## Auth
 
 `src/components/LoginGate.tsx` wraps the dashboard with a hardcoded
-`admin`/`123` check, gated on `sessionStorage`. This is a screen-privacy
-speed bump, **not real authentication** — the API routes underneath remain
-unauthenticated. Don't treat it as a security boundary.
+username/password check (see `USERNAME`/`PASSWORD` in that file), gated on
+`sessionStorage`. This is a screen-privacy speed bump, **not real
+authentication** — the API routes underneath remain unauthenticated. Don't
+treat it as a security boundary.
 
 ## Develop
 

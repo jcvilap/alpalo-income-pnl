@@ -7,12 +7,17 @@ import { classifyOrder, legNetAmount, legSetSignature, legSignature } from './ru
  * individually, powering the UI's per-leg detail row (see `legDetailRows` in
  * TradesTable.tsx). STRANGLE legs can close independently of each other, so
  * it additionally gets `openLegs`/`remainingOpenNet` tracking for that case
- * (see `closeStrangleLeg`) — CALENDAR/DIAGONAL legs are always opened and
- * closed together in one order, never independently, so they only need the
- * simpler whole-order open/close stamping.
+ * (see `closeStrangleLeg`) — same for DOUBLE_CALENDAR/DOUBLE_DIAGONAL, whose
+ * call-side and put-side time spreads are usually closed together in one
+ * 4-leg order but occasionally get filled by Schwab as two separate 2-leg
+ * orders (see `closeDoubleHalf`). CALENDAR/DIAGONAL legs (the single, not
+ * double, strategies) are always opened and closed together in one order,
+ * never independently, so they only need the simpler whole-order open/close
+ * stamping.
  */
 export function tracksLegDetail(strategy: StrategyId): boolean {
-    return strategy === 'STRANGLE' || strategy === 'CALENDAR' || strategy === 'DIAGONAL';
+    return strategy === 'STRANGLE' || strategy === 'CALENDAR' || strategy === 'DIAGONAL'
+        || strategy === 'DOUBLE_CALENDAR' || strategy === 'DOUBLE_DIAGONAL';
 }
 
 function distinctSorted<T>(values: T[]): T[] {
@@ -315,7 +320,12 @@ function closeStrangleLeg(
         for (let i = 0; i < q.length && remainingToClose > 0; ) {
             const lot = q[i];
             const legs = lot.openLegs;
-            if (lot.match.strategy !== 'STRANGLE' || !legs) { i++; continue; }
+            // Require the lot's own underlying to match the closing order's
+            // — `legSignature` below doesn't carry the lot's real underlying,
+            // so a different symbol's lot with identical right/strike/
+            // expiration would otherwise collide (see the identical fix in
+            // `closeDoubleHalf`, Codex's PR #14 review).
+            if (lot.match.strategy !== 'STRANGLE' || !legs || lot.match.order.underlying !== order.underlying) { i++; continue; }
 
             const legIdx = legs.findIndex(l => legSignature(order.underlying, l) === targetSig);
             if (legIdx === -1) { i++; continue; }
@@ -331,8 +341,16 @@ function closeStrangleLeg(
             // residual is silently dropped once the lot's last leg closes and
             // the lot is discarded, understating the true cost basis.
             // Weight = this leg's gross cash as a fraction of the whole
-            // opening order's total gross cash across both legs.
-            const grossWeight = legWeight(leg, lot.match.order.legs);
+            // opening order's total gross cash across both legs. Computed
+            // from the *original* opening leg (matched by signature in
+            // `lot.match.order.legs`, which is never mutated), not the live
+            // `leg` from `legs`/`openLegs` — that array shrinks in place as
+            // partial closes consume it, so after a first partial close its
+            // quantity (and thus its gross cash) no longer reflects the whole
+            // position's true proportions, silently skewing every later
+            // slice's cost-basis allocation (see Codex's PR #14 review).
+            const originalLeg = lot.match.order.legs.find(l => legSignature(order.underlying, l) === targetSig) ?? leg;
+            const grossWeight = legWeight(originalLeg, lot.match.order.legs);
             const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
             if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
 
@@ -447,6 +465,197 @@ function closeStrangleLeg(
     return results;
 }
 
+/**
+ * Handle a 2-leg CLOSE order that independently closes just one "half" (the
+ * call-side or put-side time spread) of an open DOUBLE_CALENDAR/
+ * DOUBLE_DIAGONAL lot — Schwab occasionally fills the close of a double
+ * calendar/diagonal as two separate same-right 2-leg orders instead of one
+ * 4-leg order, even though the position was opened (and is tracked) as a
+ * single strategy. `DOUBLE_CALENDAR_RULE`/`DOUBLE_DIAGONAL_RULE` only match
+ * whole 4-leg orders, so `classifyOrder` can't see this — this function
+ * instead looks the 2-leg group up directly against open DOUBLE_CALENDAR/
+ * DOUBLE_DIAGONAL lots' remaining legs, the same way `closeStrangleLeg`
+ * handles one STRANGLE leg closing independently.
+ *
+ * `closingLegs` must already be known to be a single right (both CALL or both
+ * PUT) — callers only invoke this once `CALENDAR_RULE`/`DIAGONAL_RULE` has
+ * matched the order as a standalone 2-leg time spread, which guarantees that
+ * shape. Contracts are consumed FIFO across all open lots that currently hold
+ * this exact half (right + both strikes + both expirations) — mirrors
+ * `closeStrangleLeg`'s multi-lot handling.
+ */
+/**
+ * @returns `matched: false` when no open DOUBLE_CALENDAR/DOUBLE_DIAGONAL lot
+ * holds this half at all — the caller should fall through to normal handling
+ * (this close order isn't one of ours). `matched: true` means a lot's legs
+ * were consumed, whether or not that lot is now fully closed (`trades` is
+ * empty while the lot's other half is still open) — the caller must treat
+ * this close as handled either way, not fall through to the "unmatched
+ * close" branch.
+ */
+function closeDoubleHalf(
+    order: OrderGroup,
+    closingLegs: Leg[],
+    openQueues: Map<string, OpenLot[]>,
+): { trades: StrategyTrade[]; matched: boolean } {
+    const targetSigs = new Set(closingLegs.map(l => legSignature(order.underlying, l)));
+    let remainingToClose = Math.min(...closingLegs.map(l => Math.abs(l.quantity)));
+    if (remainingToClose === 0 || targetSigs.size !== closingLegs.length) return { trades: [], matched: false };
+    const totalCloseContracts = remainingToClose;
+
+    interface LotClose { lot: OpenLot; openShare: number; closeShare: number; closedLegs: Leg[]; completed: boolean }
+    const lotCloses: LotClose[] = [];
+
+    for (const q of openQueues.values()) {
+        for (let i = 0; i < q.length && remainingToClose > 0; ) {
+            const lot = q[i];
+            const legs = lot.openLegs;
+            // `legSignature` is computed using `order.underlying` for both
+            // sides below (closing legs and the lot's own open legs) — if a
+            // *different* underlying's open lot happens to share identical
+            // right/strike/expiration structure, that signature collision
+            // would otherwise let this close wrongly consume the wrong
+            // symbol's legs and attribute its cash to the wrong trade (see
+            // Codex's PR #14 review). Requiring the lot's own underlying to
+            // match the closing order's underlying up front rules that out.
+            if (
+                (lot.match.strategy !== 'DOUBLE_CALENDAR' && lot.match.strategy !== 'DOUBLE_DIAGONAL')
+                || !legs
+                || lot.match.order.underlying !== order.underlying
+            ) { i++; continue; }
+
+            const matchedLegIdxs = closingLegs.map(cl => {
+                const sig = legSignature(order.underlying, cl);
+                return legs.findIndex(l => legSignature(order.underlying, l) === sig);
+            });
+            if (matchedLegIdxs.some(idx => idx === -1)) { i++; continue; }
+
+            const matchedLegs = matchedLegIdxs.map(idx => legs[idx]);
+            const legQtyAvailable = Math.min(...matchedLegs.map(l => Math.abs(l.quantity) * (lot.remainingContracts / lot.totalContracts)));
+            const consumed = Math.min(legQtyAvailable, remainingToClose);
+            if (consumed <= 0) { i++; continue; }
+
+            // Process in descending leg-index order so splicing one matched
+            // leg out of `legs` never shifts the still-pending index of
+            // another matched leg earlier in this same iteration.
+            const order_ = matchedLegIdxs.map((legIdx, k) => ({ legIdx, k })).sort((a, b) => b.legIdx - a.legIdx);
+            const closedLegsForLot: Leg[] = [];
+            for (const { legIdx, k } of order_) {
+                const leg = legs[legIdx];
+                const closingLeg = closingLegs[k];
+
+                // Same per-leg cost-basis allocation as `closeStrangleLeg` —
+                // this leg's share of the lot's actual opening netAmount
+                // (fees included), not a bare gross-cash reconstruction.
+                // Weight is computed from the leg's *original* opening
+                // quantity (matched by signature against the never-mutated
+                // `lot.match.order.legs`), not the live `leg` from `legs` —
+                // that array shrinks in place as partial closes consume it,
+                // so reusing it here would skew every later slice's weight
+                // once any prior partial close has already shrunk this same
+                // leg (see the identical fix in `closeStrangleLeg`, Codex's
+                // PR #14 review).
+                const legSig = legSignature(order.underlying, leg);
+                const originalLeg = lot.match.order.legs.find(l => legSignature(order.underlying, l) === legSig) ?? leg;
+                const grossWeight = legWeight(originalLeg, lot.match.order.legs);
+                const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
+                if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
+
+                const legCloseShare = legWeight(closingLeg, closingLegs) * (consumed / totalCloseContracts) * order.netAmount;
+                const legPnl = legOpenShare + legCloseShare;
+                const closedLeg: Leg = {
+                    ...leg,
+                    quantity: Math.sign(leg.quantity) * consumed,
+                    openClose: 'CLOSE',
+                    closedAt: order.time,
+                    openNet: legOpenShare,
+                    closeNet: legCloseShare,
+                    pnl: legPnl,
+                    pctGain: pctGain(legPnl, legOpenShare),
+                };
+                closedLegsForLot.push(closedLeg);
+
+                const newQty = Math.sign(leg.quantity) * (Math.abs(leg.quantity) - consumed);
+                if (newQty === 0) {
+                    legs.splice(legIdx, 1);
+                } else {
+                    legs[legIdx] = { ...leg, quantity: newQty };
+                }
+            }
+            lot.closedLegs = [...(lot.closedLegs ?? []), ...closedLegsForLot];
+
+            remainingToClose -= consumed;
+
+            const completed = legs.length === 0;
+            if (completed) {
+                lot.remainingContracts = 0;
+                q.splice(i, 1);
+            } else {
+                i++;
+            }
+            const openShare = closedLegsForLot.reduce((s, l) => s + (l.openNet ?? 0), 0);
+            const closeShare = closedLegsForLot.reduce((s, l) => s + (l.closeNet ?? 0), 0);
+            lotCloses.push({ lot, openShare, closeShare, closedLegs: closedLegsForLot, completed });
+        }
+    }
+
+    const results: StrategyTrade[] = [];
+    for (const { lot, openShare, closeShare, closedLegs, completed } of lotCloses) {
+        // This lot still has an open half after this close — its eventual
+        // trade record (still open, or finalized once the other half also
+        // closes) already carries this closed half's locked-in data via
+        // `lot.closedLegs` + `toTradeShape`. One double calendar/diagonal is
+        // exactly one row with exactly four legs, two closed two open, until
+        // both halves are closed — not two separate rows.
+        if (!completed) continue;
+
+        const pnl = openShare + closeShare;
+        const daysOpen = safeHoldDays(lot.match.order.time, order.time);
+
+        // The other half may have already closed independently *before* this
+        // order (a separate 2-leg close) — that realized cash lives only in
+        // `lot.closedLegs` and must be folded in here, or it would silently
+        // vanish once this lot is discarded (see the analogous note in
+        // `closeStrangleLeg`, which this mirrors).
+        const siblingClosedLegs = (lot.closedLegs ?? []).filter(l => !closedLegs.includes(l));
+        const siblingOpenNet = siblingClosedLegs.reduce((s, l) => s + (l.openNet ?? 0), 0);
+        const siblingCloseNet = siblingClosedLegs.reduce((s, l) => s + (l.closeNet ?? 0), 0);
+        const totalOpenNet = openShare + siblingOpenNet;
+        const totalCloseNet = closeShare + siblingCloseNet;
+        const totalPnl = pnl + siblingClosedLegs.reduce((s, l) => s + (l.pnl ?? 0), 0);
+
+        const allLegs = dedupeLegsBySignature(order.underlying, [...closedLegs, ...siblingClosedLegs.map(l => ({ ...l }))]);
+        const strikes = distinctSorted(allLegs.map(l => l.strike));
+        const expirations = distinctSorted(allLegs.map(l => l.expiration));
+        const openedAt = lot.match.order.time;
+
+        results.push({
+            // Includes the opening lot's own orderId, not just this close's —
+            // mirrors `closeStrangleLeg`'s id, since a single close order can
+            // in principle complete more than one distinct lot.
+            id: `double-half-close-${order.orderId}-${lot.match.order.orderId}`,
+            strategy: lot.match.strategy,
+            underlying: order.underlying,
+            status: 'closed',
+            openOrderId: lot.match.order.orderId,
+            openedAt,
+            openNet: totalOpenNet,
+            closeOrderId: order.orderId,
+            closedAt: order.time,
+            closeNet: totalCloseNet,
+            pnl: totalPnl,
+            pctGain: pctGain(totalPnl, totalOpenNet),
+            daysOpen,
+            legs: allLegs,
+            strikes,
+            expirations,
+            expirationDtes: expirations.map(e => daysAt(openedAt, e)),
+            contracts: Math.min(...closedLegs.map(l => Math.abs(l.quantity))),
+        });
+    }
+    return { trades: results, matched: lotCloses.length > 0 };
+}
+
 /** Dedupe legs by right/strike/expiration, keeping the first occurrence. */
 /**
  * Merge legs sharing the same (right, strike, expiration) signature into one
@@ -545,6 +754,36 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
             continue;
         }
 
+        // Fallback: a 2-leg CLOSE order that matches CALENDAR/DIAGONAL's own
+        // standalone shape (single right, two expirations) might actually be
+        // Schwab filling just one "half" (the call side or put side) of an
+        // open DOUBLE_CALENDAR/DOUBLE_DIAGONAL as its own separate order,
+        // instead of closing both halves together in one 4-leg order. Such an
+        // order's own CALENDAR/DIAGONAL signature never matches anything (the
+        // position is open under the double strategy's 4-leg signature), so
+        // it would otherwise fall through to the "unmatched close" branch
+        // below and silently report the wrong cost basis while leaving the
+        // real open lot stuck open forever. Checked before the general match
+        // loop so it takes priority over an (impossible, since nothing would
+        // be queued under this signature) CALENDAR/DIAGONAL pairing. See
+        // `closeDoubleHalf`.
+        if (
+            orderMatches.length === 1 &&
+            (orderMatches[0].strategy === 'CALENDAR' || orderMatches[0].strategy === 'DIAGONAL') &&
+            orderMatches[0].side === 'CLOSE' &&
+            !openQueues.get(orderMatches[0].signature)?.length
+        ) {
+            const { trades: doubleCloses, matched } = closeDoubleHalf(order, order.legs, openQueues);
+            if (matched) {
+                // Handled either way: a completed lot's trade(s) above, or
+                // (empty `doubleCloses`) a lot whose other half is still
+                // open — either way this close order must not also fall
+                // through to the "unmatched close" branch below.
+                trades.push(...doubleCloses);
+                continue;
+            }
+        }
+
         for (const match of orderMatches) {
             if (match.side === 'OPEN') {
                 const contracts = matchContracts(match) ?? 1;
@@ -573,7 +812,8 @@ export function buildTrades(orderGroups: OrderGroup[]): StrategyTrade[] {
                     openLegs: tracksLegDetail(match.strategy)
                         ? match.order.legs.map(l => ({ ...l, openNet: legNetAmount(l) }))
                         : undefined,
-                    remainingOpenNet: match.strategy === 'STRANGLE' ? match.order.netAmount : undefined,
+                    remainingOpenNet: (match.strategy === 'STRANGLE' || match.strategy === 'DOUBLE_CALENDAR' || match.strategy === 'DOUBLE_DIAGONAL')
+                        ? match.order.netAmount : undefined,
                     openFillTimes: [match.order.time],
                 });
                 openQueues.set(match.signature, q);

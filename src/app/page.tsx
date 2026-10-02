@@ -569,7 +569,7 @@ function HomeContent() {
                 {data && <EquityCurve data={data.equityCurve} />}
 
                 {/* Table */}
-                {data && <TradesTable trades={data.trades} statusFilter={statusFilter} />}
+                {data && <TradesTable trades={data.trades} statusFilter={statusFilter} onTradesChanged={() => load(true)} />}
 
                 {!data && !error && !loading && (
                     <div className="text-center text-sm py-12" style={{ color: 'var(--color-text-tertiary)' }}>

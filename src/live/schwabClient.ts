@@ -193,6 +193,37 @@ export interface SchwabOrderRequest {
     price?: number;
 }
 
+/** One leg of a multi-leg option order (see `SchwabOptionOrderRequest`). */
+export interface SchwabOptionOrderLeg {
+    instruction: 'BUY_TO_OPEN' | 'SELL_TO_OPEN' | 'BUY_TO_CLOSE' | 'SELL_TO_CLOSE';
+    quantity: number;
+    instrument: {
+        /** OCC-format option symbol, e.g. "SPXW  261016C07750000". */
+        symbol: string;
+        assetType: 'OPTION';
+    };
+}
+
+/**
+ * A multi-leg (or single-leg) option order — e.g. closing a double calendar/
+ * diagonal's 4 legs at a net limit price. `orderStrategyType` stays `SINGLE`
+ * even for multiple legs (that field distinguishes OCO/trigger strategies,
+ * not leg count); `complexOrderStrategyType: CUSTOM` is accepted by Schwab
+ * for any leg combination regardless of whether it matches one of their named
+ * complex-strategy shapes, so it's used unconditionally rather than trying to
+ * detect/label the specific strategy shape here.
+ */
+export interface SchwabOptionOrderRequest {
+    orderType: 'NET_CREDIT' | 'NET_DEBIT' | 'MARKET' | 'LIMIT';
+    session: 'NORMAL' | 'AM' | 'PM' | 'SEAMLESS';
+    duration: 'DAY' | 'GOOD_TILL_CANCEL' | 'FILL_OR_KILL';
+    orderStrategyType: 'SINGLE';
+    complexOrderStrategyType: 'CUSTOM';
+    /** Per-spread limit price (positive magnitude — direction comes from `orderType`). */
+    price: number;
+    orderLegCollection: SchwabOptionOrderLeg[];
+}
+
 export class SchwabError extends Error {
     status?: number;
     responseBody?: string;
@@ -505,19 +536,17 @@ export class SchwabClient {
                 body: options?.body ? JSON.stringify(options.body) : undefined
             });
 
-            if (retry.status === 201 || retry.status === 204) {
-                return undefined as T;
-            }
             if (!retry.ok) {
                 const body = await retry.text();
                 throw new SchwabError(`Schwab request failed after retry (${retry.status})`, retry.status, body);
             }
-            return retry.json();
-        }
-
-        // 201 Created (order placement) — no response body
-        if (response.status === 201 || response.status === 204) {
-            return undefined as T;
+            // 201 (order placement) and 204 (no content) never carry a body;
+            // some endpoints (e.g. cancel-order) also return 200 with an
+            // empty body — reading an empty body as text first, rather than
+            // always calling .json(), avoids throwing on those.
+            if (retry.status === 201 || retry.status === 204) return undefined as T;
+            const retryText = await retry.text();
+            return retryText ? JSON.parse(retryText) : (undefined as T);
         }
 
         if (!response.ok) {
@@ -525,7 +554,12 @@ export class SchwabClient {
             throw new SchwabError(`Schwab request failed (${response.status}): ${response.statusText}`, response.status, body);
         }
 
-        return response.json();
+        // See the retry branch above for why 201/204 short-circuit and why
+        // the success path otherwise text-then-parses instead of always
+        // calling .json() directly.
+        if (response.status === 201 || response.status === 204) return undefined as T;
+        const text = await response.text();
+        return text ? JSON.parse(text) : (undefined as T);
     }
 
     private async ensureAuthenticated(): Promise<void> {
@@ -606,6 +640,35 @@ export class SchwabClient {
         // The API returns 201 with a Location header; no JSON body
         await this.request<undefined>('POST', `${TRADER_BASE}/accounts/${hash}/orders`, { body: order });
         return null; // Order ID would require parsing Location header, which fetch doesn't expose easily
+    }
+
+    /**
+     * Cancel a working (not-yet-filled) order for the configured account.
+     * Schwab returns 200/201/204 with no body on success.
+     */
+    async cancelOrder(orderId: string): Promise<void> {
+        const hash = await this.resolveAccountHash();
+        await this.request<undefined>('DELETE', `${TRADER_BASE}/accounts/${hash}/orders/${orderId}`);
+    }
+
+    /**
+     * Place a new multi-leg (or single-leg) option order — e.g. a take-profit
+     * limit order closing a strategy's legs at a target net price.
+     */
+    async placeOptionOrder(order: SchwabOptionOrderRequest): Promise<void> {
+        const hash = await this.resolveAccountHash();
+        await this.request<undefined>('POST', `${TRADER_BASE}/accounts/${hash}/orders`, { body: order });
+    }
+
+    /**
+     * Replace an existing working order with a new one in a single call —
+     * Schwab's replace endpoint atomically cancels `orderId` and places
+     * `order` in its stead (PUT, not a separate cancel+POST), which avoids a
+     * window where neither the old nor the new order is working.
+     */
+    async replaceOrder(orderId: string, order: SchwabOptionOrderRequest): Promise<void> {
+        const hash = await this.resolveAccountHash();
+        await this.request<undefined>('PUT', `${TRADER_BASE}/accounts/${hash}/orders/${orderId}`, { body: order });
     }
 
     /**

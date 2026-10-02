@@ -1,6 +1,7 @@
 'use client';
 
 import { Fragment, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import {
     type ColumnDef,
@@ -15,7 +16,7 @@ import {
     getSortedRowModel,
     useReactTable,
 } from '@tanstack/react-table';
-import { ChevronDown, ChevronRight, ChevronsUpDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronsUpDown, ChevronUp, MoreVertical } from 'lucide-react';
 import type { Leg, StrategyId, StrategyTrade, WorkingCloseOrder } from '@/lib/strategy/types';
 import { formatCurrency, formatDate } from '@/lib/format';
 
@@ -70,7 +71,7 @@ function orderByPinning<T extends { column: { getIsPinned: () => 'left' | 'right
     return [...left, ...center, ...right];
 }
 
-const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations', 'range']);
+const NON_NUMERIC_COLUMNS = new Set(['underlying', 'status', 'strategy', 'openedAt', 'closedAt', 'strikes', 'expirations', 'range', 'actions']);
 
 /** True for trades that can show a per-leg breakdown row: strangles, calendars, and diagonals (open or closed). */
 function hasLegDetail(trade: StrategyTrade): boolean {
@@ -460,6 +461,208 @@ function remainingDte(expiration: string): number | undefined {
     }
 }
 
+/** Take-profit % stops offered in the row actions menu, 10%–50% in 5% steps. */
+const TAKE_PROFIT_PERCENTS = [10, 15, 20, 25, 30, 35, 40, 45, 50];
+
+/** Which confirm screen the menu is showing, if any. */
+type PendingAction = { type: 'cancel' } | { type: 'take-profit'; pct: number };
+
+/**
+ * Row actions menu ("..."), one per trade. Live actions: canceling a trade's
+ * working closing order (if it has one), and setting a take-profit GTC limit
+ * order at a chosen % gain (10–50%, 5% steps) — which replaces any existing
+ * working close order in place (Schwab's atomic PUT) rather than canceling
+ * and placing separately, or places a fresh order if none exists.
+ *
+ * Positioned `fixed` against the trigger button's own rect (not the table
+ * row) and rendered through a portal straight into `document.body` — the
+ * table's pinned (sticky-positioned) columns each get their own stacking
+ * context with an opaque background, which otherwise paints over a `fixed`
+ * descendant still nested inside the table's `overflow-x: auto` container
+ * regardless of z-index (confirmed visually: the menu's own left portion was
+ * clipped by the pinned "% Gain" column). A portal sidesteps that entirely.
+ * Each menu owns its own open/closed state rather than going through the
+ * shared `CellTooltipHost` singleton, since a menu (unlike a tooltip) needs to
+ * stay open while the user clicks a confirm button inside it.
+ */
+function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancelled: () => void }) {
+    const [open, setOpen] = useState(false);
+    const [confirming, setConfirming] = useState<PendingAction | null>(null);
+    const [pending, setPending] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [anchor, setAnchor] = useState<{ top: number; left: number; width: number } | null>(null);
+
+    const closingOrder = trade.status === 'open' ? trade.workingCloseOrder : undefined;
+    // Take-profit only supports whole-position, single-opening-order
+    // strategies that `setTakeProfitOrder` (service.ts) knows how to rebuild
+    // a closing order for — see TAKE_PROFIT_STRATEGIES there.
+    const supportsTakeProfit = trade.status === 'open'
+        && (trade.strategy === 'DOUBLE_CALENDAR' || trade.strategy === 'DOUBLE_DIAGONAL');
+
+    const close = () => {
+        setOpen(false);
+        setConfirming(null);
+        setError(null);
+    };
+
+    useEffect(() => {
+        if (!open) return;
+        const onClickOutside = (e: MouseEvent) => {
+            const target = e.target as Element | null;
+            if (target?.closest('[data-row-actions-menu]')) return;
+            close();
+        };
+        document.addEventListener('mousedown', onClickOutside);
+        return () => document.removeEventListener('mousedown', onClickOutside);
+    }, [open]);
+
+    const handleToggle = (e: React.MouseEvent<HTMLButtonElement>) => {
+        e.stopPropagation();
+        if (open) {
+            close();
+            return;
+        }
+        const rect = e.currentTarget.getBoundingClientRect();
+        setAnchor({ top: rect.bottom, left: rect.right, width: rect.width });
+        setOpen(true);
+    };
+
+    const handleCancelOrder = async () => {
+        if (!closingOrder) return;
+        setPending(true);
+        setError(null);
+        try {
+            const res = await fetch(`/api/orders/${closingOrder.orderId}`, { method: 'DELETE' });
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+            close();
+            onCancelled();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setPending(false);
+        }
+    };
+
+    const handleSetTakeProfit = async (pct: number) => {
+        setPending(true);
+        setError(null);
+        try {
+            const res = await fetch(`/api/trades/${trade.openOrderId}/take-profit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pctGain: pct }),
+            });
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+            close();
+            onCancelled();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setPending(false);
+        }
+    };
+
+    return (
+        <span data-row-actions-menu="" style={{ position: 'relative', display: 'inline-block' }}>
+            <button
+                type="button"
+                onClick={handleToggle}
+                className="inline-flex items-center justify-center rounded-md hover:opacity-70"
+                style={{ width: 24, height: 24, color: 'var(--color-text-tertiary)' }}
+                aria-label="Row actions"
+            >
+                <MoreVertical size={16} />
+            </button>
+            {open && anchor && createPortal(
+                <div
+                    data-row-actions-menu=""
+                    role="menu"
+                    className="rounded-lg py-1 text-sm shadow-lg bg-surface-elevated"
+                    style={{
+                        position: 'fixed',
+                        zIndex: 50,
+                        top: anchor.top + 4,
+                        left: anchor.left,
+                        transform: 'translateX(-100%)',
+                        border: '1px solid var(--color-border)',
+                        color: 'var(--color-text-primary)',
+                        width: 220,
+                    }}
+                >
+                    {confirming ? (
+                        <div className="px-3 py-2 flex flex-col gap-2">
+                            <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                                {confirming.type === 'cancel'
+                                    ? 'Cancel this closing order on Schwab?'
+                                    : closingOrder
+                                        ? `Replace the working closing order with a take-profit limit at ${confirming.pct}% gain?`
+                                        : `Place a take-profit limit order at ${confirming.pct}% gain?`}
+                            </span>
+                            {error && (
+                                <span className="text-xs" style={{ color: 'var(--color-danger)' }}>
+                                    {error}
+                                </span>
+                            )}
+                            <div className="flex items-center gap-2 justify-end">
+                                <button
+                                    type="button"
+                                    onClick={() => { setConfirming(null); setError(null); }}
+                                    disabled={pending}
+                                    className="rounded-md px-2 py-1 text-xs font-medium disabled:opacity-60"
+                                    style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
+                                >
+                                    Back
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => confirming.type === 'cancel' ? handleCancelOrder() : handleSetTakeProfit(confirming.pct)}
+                                    disabled={pending}
+                                    className="rounded-md px-2 py-1 text-xs font-medium text-white disabled:opacity-60"
+                                    style={{ background: confirming.type === 'cancel' ? 'var(--color-danger)' : 'var(--color-primary)' }}
+                                >
+                                    {pending
+                                        ? (confirming.type === 'cancel' ? 'Canceling…' : 'Submitting…')
+                                        : (confirming.type === 'cancel' ? 'Yes, cancel' : (closingOrder ? 'Yes, replace' : 'Yes, place order'))}
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <>
+                            <button
+                                type="button"
+                                role="menuitem"
+                                disabled={!closingOrder}
+                                onClick={() => setConfirming({ type: 'cancel' })}
+                                className="block w-full text-left px-3 py-1.5 truncate disabled:opacity-40 hover:opacity-80 disabled:hover:opacity-40"
+                                style={{ cursor: closingOrder ? 'pointer' : 'not-allowed' }}
+                                title={closingOrder ? undefined : 'No closing order on this trade'}
+                            >
+                                Cancel closing order
+                            </button>
+                            <div className="my-1" style={{ borderTop: '1px solid var(--color-border-light)' }} />
+                            {TAKE_PROFIT_PERCENTS.map((pct) => (
+                                <button
+                                    key={pct}
+                                    type="button"
+                                    role="menuitem"
+                                    disabled={!supportsTakeProfit}
+                                    onClick={() => setConfirming({ type: 'take-profit', pct })}
+                                    title={supportsTakeProfit ? undefined : 'Only available for open double calendar/diagonal trades'}
+                                    className="block w-full text-left px-3 py-1.5 truncate disabled:opacity-40 hover:opacity-80 disabled:hover:opacity-40"
+                                    style={{ cursor: supportsTakeProfit ? 'pointer' : 'not-allowed' }}
+                                >
+                                    Set take profit @{pct}%
+                                </button>
+                            ))}
+                        </>
+                    )}
+                </div>,
+                document.body,
+            )}
+        </span>
+    );
+}
+
 /**
  * Build one synthetic per-leg "trade" per leg of a still-open strangle, so
  * the detail row can render through the exact same column defs as the parent
@@ -491,7 +694,9 @@ function legDetailRows(trade: StrategyTrade): StrategyTrade[] {
     }));
 }
 
-const columns: ColumnDef<StrategyTrade>[] = [
+/** `onCancelled` re-fetches trades (bypassing cache) so a canceled order's working-close state disappears immediately instead of waiting for the next natural refresh. */
+function buildColumns(onCancelled: () => void): ColumnDef<StrategyTrade>[] {
+    return [
     {
         accessorKey: 'underlying',
         header: 'Symbol',
@@ -692,7 +897,33 @@ const columns: ColumnDef<StrategyTrade>[] = [
         aggregatedCell: () => null,
         enableGrouping: false,
     },
-];
+    {
+        id: 'actions',
+        header: '',
+        // Matches the column's actual rendered width (24px button + px-3's
+        // 24px of horizontal padding) — sticky-right pinning positions this
+        // and the "% Gain" column before it using each column's `size`
+        // (TanStack defaults to 150 when unset), so leaving this at the
+        // default left a ~100px gap between the two pinned columns even
+        // though their actual rendered widths were much narrower.
+        size: 48,
+        cell: (ctx) => {
+            if (ctx.row.getIsGrouped?.()) return null;
+            const trade = ctx.row.original;
+            // Synthetic per-leg detail rows (see `legDetailRows`/`fakeCellContext`)
+            // share the parent trade's `workingCloseOrder` since they spread
+            // `...trade` — showing "cancel closing order" per-leg would be
+            // misleading (the working order closes the whole position, not
+            // one leg), so suppress the menu entirely on those rows.
+            if (trade.id.includes('-leg-')) return null;
+            return <RowActionsMenu trade={trade} onCancelled={onCancelled} />;
+        },
+        aggregatedCell: () => null,
+        enableSorting: false,
+        enableGrouping: false,
+    },
+    ];
+}
 
 /**
  * One trade as a mobile card. Leads with the range gauge full-width and
@@ -700,7 +931,7 @@ const columns: ColumnDef<StrategyTrade>[] = [
  * when scanning open positions on a phone — with symbol/strategy/P&L as
  * secondary at-a-glance info and the rest tucked into a label/value grid.
  */
-function TradeCard({ trade }: { trade: StrategyTrade }) {
+function TradeCard({ trade, onCancelled }: { trade: StrategyTrade; onCancelled: () => void }) {
     const [expanded, setExpanded] = useState(false);
     const showLegToggle = hasLegDetail(trade);
     const bounds = trade.status === 'open' && trade.strategy !== 'CALENDAR' && trade.strategy !== 'DIAGONAL'
@@ -743,14 +974,17 @@ function TradeCard({ trade }: { trade: StrategyTrade }) {
                         {trade.strikes.join(' / ')}
                     </span>
                 </div>
-                <div className="flex flex-col items-end shrink-0">
-                    <span className="tabular-nums font-semibold text-base" style={{ color: toneColor(trade.pnl) }}>
-                        {trade.pnl == null ? '—' : formatCurrency(trade.pnl, { sign: true })}
-                        {trade.pnlIsEstimate ? <span title="Live mark-to-market estimate">*</span> : null}
-                    </span>
-                    <span className="tabular-nums text-xs" style={{ color: toneColor(trade.pctGain) }}>
-                        {trade.pctGain == null ? '—' : `${trade.pctGain > 0 ? '+' : ''}${trade.pctGain.toFixed(1)}%`}
-                    </span>
+                <div className="flex items-start gap-1 shrink-0">
+                    <div className="flex flex-col items-end">
+                        <span className="tabular-nums font-semibold text-base" style={{ color: toneColor(trade.pnl) }}>
+                            {trade.pnl == null ? '—' : formatCurrency(trade.pnl, { sign: true })}
+                            {trade.pnlIsEstimate ? <span title="Live mark-to-market estimate">*</span> : null}
+                        </span>
+                        <span className="tabular-nums text-xs" style={{ color: toneColor(trade.pctGain) }}>
+                            {trade.pctGain == null ? '—' : `${trade.pctGain > 0 ? '+' : ''}${trade.pctGain.toFixed(1)}%`}
+                        </span>
+                    </div>
+                    <RowActionsMenu trade={trade} onCancelled={onCancelled} />
                 </div>
             </div>
 
@@ -811,18 +1045,18 @@ function TradeCard({ trade }: { trade: StrategyTrade }) {
 }
 
 /** Mobile card list — same data/filters as the table, laid out for narrow screens. */
-function TradeCardList({ trades }: { trades: StrategyTrade[] }) {
+function TradeCardList({ trades, onCancelled }: { trades: StrategyTrade[]; onCancelled: () => void }) {
     return (
         <div className="flex flex-col gap-2">
             {trades.map((t) => (
-                <TradeCard key={t.id} trade={t} />
+                <TradeCard key={t.id} trade={t} onCancelled={onCancelled} />
             ))}
         </div>
     );
 }
 
 /** Trades table — sortable, filterable, groupable via TanStack Table. */
-export function TradesTable({ trades, statusFilter }: { trades: StrategyTrade[]; statusFilter: 'all' | 'open' | 'closed' }) {
+export function TradesTable({ trades, statusFilter, onTradesChanged }: { trades: StrategyTrade[]; statusFilter: 'all' | 'open' | 'closed'; onTradesChanged?: () => void }) {
     const [sorting, setSorting] = useState<SortingState>([
         { id: 'status', desc: false },
         { id: 'openedAt', desc: true },
@@ -846,10 +1080,12 @@ export function TradesTable({ trades, statusFilter }: { trades: StrategyTrade[];
         [trades, statusFilter],
     );
 
+    const columns = useMemo(() => buildColumns(() => onTradesChanged?.()), [onTradesChanged]);
+
     const table = useReactTable({
         data: filtered,
         columns,
-        state: { sorting, grouping, globalFilter, columnVisibility, columnPinning: { right: ['pctGain'] } },
+        state: { sorting, grouping, globalFilter, columnVisibility, columnPinning: { right: ['pctGain', 'actions'] } },
         onSortingChange: setSorting,
         onGroupingChange: setGrouping,
         onGlobalFilterChange: setGlobalFilter,
@@ -911,7 +1147,7 @@ export function TradesTable({ trades, statusFilter }: { trades: StrategyTrade[];
                 <>
                 {/* Mobile: card list, no grouping — the range gauge and key figures take priority over the dense table. */}
                 <div className="sm:hidden">
-                    <TradeCardList trades={table.getSortedRowModel().rows.map((r) => r.original)} />
+                    <TradeCardList trades={table.getSortedRowModel().rows.map((r) => r.original)} onCancelled={() => onTradesChanged?.()} />
                 </div>
                 <div
                     className="hidden sm:block rounded-xl bg-surface transition-theme overflow-x-auto"

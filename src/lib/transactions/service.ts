@@ -9,7 +9,7 @@ import { computeMetrics, cumulativePnlSeries } from '@/lib/strategy/metrics';
 import type { OptionRight, StrategyId, StrategyMetrics, StrategyTrade, WorkingCloseOrder } from '@/lib/strategy/types';
 
 /** Bump when detection/normalization logic changes, to invalidate cached results. */
-const STRATEGY_VERSION = 'v32';
+const STRATEGY_VERSION = 'v33';
 /** TTL for cached raw transactions and parsed results (seconds). */
 const RAW_TTL_SECONDS = 15 * 60;
 const PARSED_TTL_SECONDS = 15 * 60;
@@ -63,7 +63,7 @@ export interface TradesResult {
     fetchedAt: string;
 }
 
-function firstSchwabAccount(): AccountConfig {
+export function firstSchwabAccount(): AccountConfig {
     const accounts = getConfiguredAccounts();
     const schwab = accounts.find(a => a.broker === BrokerType.SCHWAB);
     if (!schwab) {
@@ -820,6 +820,114 @@ async function attachWorkingCloseOrders(
         };
         trade.workingCloseOrder = workingCloseOrder;
     }
+}
+
+/** Strategies the take-profit action supports — the ones with a single, well-defined whole-position close (see `tracksLegDetail`/`closeDoubleHalf` for why DOUBLE_CALENDAR/DOUBLE_DIAGONAL legs can close as one order or two). */
+const TAKE_PROFIT_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR', 'DOUBLE_DIAGONAL'];
+
+export class TakeProfitError extends Error {}
+
+/**
+ * Place (or replace) a GTC limit order that closes every still-open leg of
+ * the trade identified by `openOrderId`, targeting a `pctGain`% realized gain
+ * — i.e. `closeNet` such that `(openNet + closeNet) / |openNet| * 100 ===
+ * pctGain`. Re-derives the trade fresh from `getTrades` rather than trusting
+ * a client-supplied leg list, so a caller can't dictate arbitrary order legs/
+ * prices on a real brokerage account — only a `pctGain` number crosses the
+ * API boundary.
+ *
+ * If the trade already has a working close order (`workingCloseOrder`),
+ * replaces it in place via Schwab's PUT endpoint (atomic cancel+place, no
+ * window with neither order working) rather than issuing a separate
+ * cancel-then-place. Otherwise places a brand-new order.
+ */
+export async function setTakeProfitOrder(openOrderId: string, pctGain: number): Promise<{ orderId?: string; replaced: boolean }> {
+    if (!Number.isFinite(pctGain) || pctGain <= 0) {
+        throw new TakeProfitError(`Invalid take-profit percent: ${pctGain}`);
+    }
+
+    const account = firstSchwabAccount();
+    const hash = account.accountIdKey ?? account.key;
+    const to = new Date().toISOString();
+    const from = clampLookback(to);
+
+    const { trades } = await getTrades({ from, to, strategies: TAKE_PROFIT_STRATEGIES, status: 'open' });
+    const trade = trades.find(t => t.openOrderId === openOrderId);
+    if (!trade) {
+        throw new TakeProfitError(`No open trade found for order ${openOrderId}`);
+    }
+
+    const openLegs = trade.legs.filter(l => l.openClose === 'OPEN');
+    if (openLegs.length === 0) {
+        throw new TakeProfitError(`Trade ${openOrderId} has no open legs to close`);
+    }
+    if (openLegs.some(l => !l.symbol)) {
+        throw new TakeProfitError(`Trade ${openOrderId} is missing an option symbol on one or more legs`);
+    }
+
+    // Solve for closeNet given the target pctGain: pnl = openNet + closeNet,
+    // pctGain = pnl / |openNet| * 100 (see StrategyTrade.pctGain's own
+    // definition, which this mirrors so "take profit @20%" means exactly what
+    // the dashboard's %Gain column would show once this order fills).
+    const openNet = trade.openNet;
+    const targetPnl = (pctGain / 100) * Math.abs(openNet);
+    const closeNet = targetPnl - openNet;
+
+    // Schwab's multi-leg price is a positive per-spread magnitude with
+    // direction carried separately by orderType — a positive closeNet (net
+    // credit received to close) is NET_CREDIT, negative (net debit paid) is
+    // NET_DEBIT.
+    const orderType: 'NET_CREDIT' | 'NET_DEBIT' = closeNet >= 0 ? 'NET_CREDIT' : 'NET_DEBIT';
+    const spreadQuantity = trade.contracts ?? 1;
+    const rawPrice = Math.abs(closeNet) / spreadQuantity / 100;
+    // Schwab rejects a limit price with more than 2 decimal places (confirmed
+    // live: a raw per-spread price like 36.81888 comes back REJECTED) — round
+    // to whole cents, and round in whichever direction is at least as
+    // favorable to the target gain rather than naively to nearest: credit
+    // orders round UP (ask for slightly more than the exact target so the
+    // realized gain is never short of pctGain once filled), debit orders
+    // round DOWN (offer to pay slightly less).
+    const price = orderType === 'NET_CREDIT'
+        ? Math.ceil(rawPrice * 100) / 100
+        : Math.floor(rawPrice * 100) / 100;
+
+    const orderLegCollection = openLegs.map(leg => ({
+        // Closing instruction is the opposite action of how the leg was
+        // opened: a long (bought, quantity > 0) open leg closes by selling;
+        // a short (sold, quantity < 0) open leg closes by buying back.
+        instruction: (leg.quantity > 0 ? 'SELL_TO_CLOSE' : 'BUY_TO_CLOSE') as 'SELL_TO_CLOSE' | 'BUY_TO_CLOSE',
+        quantity: Math.abs(leg.quantity),
+        instrument: { symbol: leg.symbol!, assetType: 'OPTION' as const },
+    }));
+
+    const orderRequest = {
+        orderType,
+        session: 'NORMAL' as const,
+        duration: 'GOOD_TILL_CANCEL' as const,
+        orderStrategyType: 'SINGLE' as const,
+        complexOrderStrategyType: 'CUSTOM' as const,
+        price,
+        orderLegCollection,
+    };
+
+    return withRedis(async (redis) => {
+        const client = new SchwabClient({
+            name: account.name,
+            clientId: account.key,
+            clientSecret: account.secret,
+            accessToken: account.accessToken,
+            refreshToken: account.refreshToken,
+            accountHash: account.accountIdKey,
+            redis,
+        });
+
+        if (trade.workingCloseOrder) {
+            await client.replaceOrder(trade.workingCloseOrder.orderId, orderRequest);
+            return { replaced: true };
+        }
+        await client.placeOptionOrder(orderRequest);
+        return { replaced: false };
+    });
 }
 
 async function getRawTransactions(
