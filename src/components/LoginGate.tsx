@@ -3,22 +3,23 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Lock } from 'lucide-react';
 
-const SESSION_KEY = 'alpalo-income-pnl:authed';
-const PASSWORD_KEY = 'alpalo-income-pnl:password';
-const USERNAME = 'jcvilap';
-const PASSWORD = '123Qwert!';
-
 /**
- * Lightweight client-side speed bump, not real authentication — the
- * credentials are hardcoded and checked entirely in the browser. Good enough
- * to keep the dashboard off a shared screen's default view, not to protect
- * the underlying data (the API routes remain unauthenticated).
+ * Lightweight speed bump, not real authentication — just enough to keep the
+ * dashboard off a shared screen's default view, not to protect the
+ * underlying data (the API routes remain unauthenticated; see README's
+ * "Auth" section). The actual credentials live server-side only, in
+ * `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` env vars checked by `/api/login`
+ * — never bundled into client JS. The browser only ever holds a session
+ * marker via an httpOnly cookie (`/api/login` sets it, `/api/session` checks
+ * for it since browser JS can't read an httpOnly cookie directly, `/api/logout`
+ * clears it) — never the credential itself.
  */
 export function LoginGate({ children }: { children: React.ReactNode }) {
     const [authed, setAuthed] = useState<boolean | null>(null);
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [error, setError] = useState(false);
+    const [submitting, setSubmitting] = useState(false);
 
     useEffect(() => {
         // Skip the speed bump entirely in local dev — there's no shared
@@ -28,20 +29,31 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
             setAuthed(true);
             return;
         }
-        setAuthed(sessionStorage.getItem(SESSION_KEY) === 'true');
-        const savedPassword = sessionStorage.getItem(PASSWORD_KEY);
-        if (savedPassword) setPassword(savedPassword);
+        fetch('/api/session')
+            .then((res) => res.json())
+            .then((json) => setAuthed(Boolean(json.authed)))
+            .catch(() => setAuthed(false));
     }, []);
 
-    const onSubmit = (e: FormEvent) => {
+    const onSubmit = async (e: FormEvent) => {
         e.preventDefault();
-        if (username === USERNAME && password === PASSWORD) {
-            sessionStorage.setItem(SESSION_KEY, 'true');
-            sessionStorage.setItem(PASSWORD_KEY, password);
-            setAuthed(true);
-            setError(false);
-        } else {
+        setSubmitting(true);
+        try {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password }),
+            });
+            if (res.ok) {
+                setAuthed(true);
+                setError(false);
+            } else {
+                setError(true);
+            }
+        } catch {
             setError(true);
+        } finally {
+            setSubmitting(false);
         }
     };
 
@@ -109,9 +121,10 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
 
                 <button
                     type="submit"
-                    className="rounded-lg px-4 py-3 text-base font-medium text-white bg-gradient-button hover:bg-gradient-button-hover"
+                    disabled={submitting}
+                    className="rounded-lg px-4 py-3 text-base font-medium text-white bg-gradient-button hover:bg-gradient-button-hover disabled:opacity-60"
                 >
-                    Sign in
+                    {submitting ? 'Signing in…' : 'Sign in'}
                 </button>
             </form>
         </main>
