@@ -746,25 +746,58 @@ async function attachWorkingCloseOrders(
     for (const trade of openTrades) {
         const openLegs = trade.legs.filter(l => l.openClose === 'OPEN');
         if (openLegs.length === 0) continue;
-        const legKey = (l: { right: string; strike: number; expiration: string }) => `${l.right}|${l.strike}|${l.expiration}`;
-        const tradeLegKeys = new Set(openLegs.map(legKey));
+        // Include `underlying` in the key — two different underlyings can
+        // otherwise share the same right/strike/expiration (e.g. two
+        // single-leg LEAPS positions at the same strike/expiry on different
+        // symbols), which would wrongly let one's working order match the
+        // other's trade.
+        const legKey = (l: { underlying: string; right: string; strike: number; expiration: string }) =>
+            `${l.underlying}|${l.right}|${l.strike}|${l.expiration}`;
+        // Require the order leg's quantity to match the trade leg's own
+        // remaining open quantity — a partial close (e.g. 2 contracts closing
+        // out of a 5-contract position) must not be treated as if it closed
+        // the whole trade; only an order whose every leg exactly covers the
+        // full remaining position counts as "this order closes this trade".
+        const tradeLegQuantities = new Map(openLegs.map(l => [legKey(l), Math.abs(l.quantity)]));
 
         const match = decoded.find(({ legs }) => {
-            if (legs.length !== tradeLegKeys.size) return false;
-            const orderLegKeys = new Set(legs.map(l => legKey(l.parsed)));
-            if (orderLegKeys.size !== tradeLegKeys.size) return false;
-            for (const key of tradeLegKeys) if (!orderLegKeys.has(key)) return false;
-            return true;
+            if (legs.length !== tradeLegQuantities.size) return false;
+            const seen = new Set<string>();
+            for (const l of legs) {
+                const key = legKey(l.parsed);
+                const expectedQty = tradeLegQuantities.get(key);
+                if (expectedQty == null || expectedQty !== l.raw.quantity) return false;
+                seen.add(key);
+            }
+            return seen.size === tradeLegQuantities.size;
         });
         if (!match) continue;
 
         // Net cash the order would generate if it fills. Schwab's `price` on
-        // a multi-leg order is an unsigned magnitude for the whole combo —
-        // direction comes from `orderType` (NET_CREDIT/NET_DEBIT), not the
-        // sign of `price` or any per-leg math — same sign convention as
-        // `closeNet` elsewhere (positive = credit received).
-        const magnitude = (match.order.price ?? 0) * (trade.contracts ?? 1) * OPTION_MULTIPLIER;
-        const closeValue = match.order.orderType === 'NET_DEBIT' ? -magnitude : magnitude;
+        // a multi-leg order is a per-spread magnitude — `order.quantity` is
+        // the number of spreads (not `trade.contracts`, which is the largest
+        // *leg* quantity and can overstate spread count on a ratio spread
+        // like a 1:2:1 butterfly) — so total cash is price × order quantity.
+        // Direction comes from `orderType` (NET_CREDIT/NET_DEBIT) when
+        // present; a single-leg order has no `orderType` combo label, so fall
+        // back to that leg's own BUY_TO_CLOSE (debit) / SELL_TO_CLOSE
+        // (credit) instruction instead of assuming every non-NET_DEBIT order
+        // is a credit.
+        const spreadQuantity = match.order.quantity ?? match.legs[0]?.raw.quantity ?? 1;
+        const magnitude = (match.order.price ?? 0) * spreadQuantity * OPTION_MULTIPLIER;
+        let closeValue: number;
+        if (match.order.orderType === 'NET_DEBIT') {
+            closeValue = -magnitude;
+        } else if (match.order.orderType === 'NET_CREDIT') {
+            closeValue = magnitude;
+        } else if (match.legs.length === 1) {
+            closeValue = match.legs[0].raw.instruction === 'SELL_TO_CLOSE' ? magnitude : -magnitude;
+        } else {
+            // Multi-leg order with no explicit NET_CREDIT/NET_DEBIT label —
+            // no reliable way to infer direction, so skip rather than risk
+            // showing P&L with the wrong sign.
+            continue;
+        }
 
         const estPnl = trade.openNet + closeValue;
         const estPctGain = trade.openNet !== 0 ? (estPnl / Math.abs(trade.openNet)) * 100 : undefined;
