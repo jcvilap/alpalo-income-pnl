@@ -320,7 +320,12 @@ function closeStrangleLeg(
         for (let i = 0; i < q.length && remainingToClose > 0; ) {
             const lot = q[i];
             const legs = lot.openLegs;
-            if (lot.match.strategy !== 'STRANGLE' || !legs) { i++; continue; }
+            // Require the lot's own underlying to match the closing order's
+            // — `legSignature` below doesn't carry the lot's real underlying,
+            // so a different symbol's lot with identical right/strike/
+            // expiration would otherwise collide (see the identical fix in
+            // `closeDoubleHalf`, Codex's PR #14 review).
+            if (lot.match.strategy !== 'STRANGLE' || !legs || lot.match.order.underlying !== order.underlying) { i++; continue; }
 
             const legIdx = legs.findIndex(l => legSignature(order.underlying, l) === targetSig);
             if (legIdx === -1) { i++; continue; }
@@ -336,8 +341,16 @@ function closeStrangleLeg(
             // residual is silently dropped once the lot's last leg closes and
             // the lot is discarded, understating the true cost basis.
             // Weight = this leg's gross cash as a fraction of the whole
-            // opening order's total gross cash across both legs.
-            const grossWeight = legWeight(leg, lot.match.order.legs);
+            // opening order's total gross cash across both legs. Computed
+            // from the *original* opening leg (matched by signature in
+            // `lot.match.order.legs`, which is never mutated), not the live
+            // `leg` from `legs`/`openLegs` — that array shrinks in place as
+            // partial closes consume it, so after a first partial close its
+            // quantity (and thus its gross cash) no longer reflects the whole
+            // position's true proportions, silently skewing every later
+            // slice's cost-basis allocation (see Codex's PR #14 review).
+            const originalLeg = lot.match.order.legs.find(l => legSignature(order.underlying, l) === targetSig) ?? leg;
+            const grossWeight = legWeight(originalLeg, lot.match.order.legs);
             const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
             if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
 
@@ -497,7 +510,19 @@ function closeDoubleHalf(
         for (let i = 0; i < q.length && remainingToClose > 0; ) {
             const lot = q[i];
             const legs = lot.openLegs;
-            if ((lot.match.strategy !== 'DOUBLE_CALENDAR' && lot.match.strategy !== 'DOUBLE_DIAGONAL') || !legs) { i++; continue; }
+            // `legSignature` is computed using `order.underlying` for both
+            // sides below (closing legs and the lot's own open legs) — if a
+            // *different* underlying's open lot happens to share identical
+            // right/strike/expiration structure, that signature collision
+            // would otherwise let this close wrongly consume the wrong
+            // symbol's legs and attribute its cash to the wrong trade (see
+            // Codex's PR #14 review). Requiring the lot's own underlying to
+            // match the closing order's underlying up front rules that out.
+            if (
+                (lot.match.strategy !== 'DOUBLE_CALENDAR' && lot.match.strategy !== 'DOUBLE_DIAGONAL')
+                || !legs
+                || lot.match.order.underlying !== order.underlying
+            ) { i++; continue; }
 
             const matchedLegIdxs = closingLegs.map(cl => {
                 const sig = legSignature(order.underlying, cl);
@@ -522,7 +547,17 @@ function closeDoubleHalf(
                 // Same per-leg cost-basis allocation as `closeStrangleLeg` —
                 // this leg's share of the lot's actual opening netAmount
                 // (fees included), not a bare gross-cash reconstruction.
-                const grossWeight = legWeight(leg, lot.match.order.legs);
+                // Weight is computed from the leg's *original* opening
+                // quantity (matched by signature against the never-mutated
+                // `lot.match.order.legs`), not the live `leg` from `legs` —
+                // that array shrinks in place as partial closes consume it,
+                // so reusing it here would skew every later slice's weight
+                // once any prior partial close has already shrunk this same
+                // leg (see the identical fix in `closeStrangleLeg`, Codex's
+                // PR #14 review).
+                const legSig = legSignature(order.underlying, leg);
+                const originalLeg = lot.match.order.legs.find(l => legSignature(order.underlying, l) === legSig) ?? leg;
+                const grossWeight = legWeight(originalLeg, lot.match.order.legs);
                 const legOpenShare = grossWeight * (consumed / lot.totalContracts) * lot.match.order.netAmount;
                 if (lot.remainingOpenNet != null) lot.remainingOpenNet -= legOpenShare;
 
