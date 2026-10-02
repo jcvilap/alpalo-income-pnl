@@ -16,7 +16,7 @@ import {
     useReactTable,
 } from '@tanstack/react-table';
 import { ChevronDown, ChevronRight, ChevronsUpDown, ChevronUp } from 'lucide-react';
-import type { Leg, StrategyId, StrategyTrade } from '@/lib/strategy/types';
+import type { Leg, StrategyId, StrategyTrade, WorkingCloseOrder } from '@/lib/strategy/types';
 import { formatCurrency, formatDate } from '@/lib/format';
 
 const GROUP_OPTIONS = [
@@ -165,63 +165,69 @@ function formatItmPct(pct: number): string {
     return pct.toFixed(4);
 }
 
-/** Data the shared singleton tooltip needs to render for whichever gauge is currently hovered/tapped. */
-interface RangeTooltipData {
-    price: number;
-    low: number;
-    high: number;
-    /** Viewport-relative anchor (the hovered/tapped gauge's bounding rect) to position the fixed tooltip against. */
+/** One label/value line in the shared cell tooltip. An empty label continues the previous row's label visually (see Legs rows). */
+interface CellTooltipRow {
+    label: string;
+    value: string;
+}
+
+/** Data the shared singleton tooltip needs to render for whichever cell is currently hovered/tapped. */
+interface CellTooltipData {
+    rows: CellTooltipRow[];
+    /** Viewport-relative anchor (the hovered/tapped cell's bounding rect) to position the fixed tooltip against. */
     anchor: { top: number; left: number; width: number };
-    /** This trade's expiration dates and their original DTE-at-open, shown in the tooltip instead of taking up card space. */
-    expirations?: { date: string; dte: number | undefined }[];
+    width?: number;
 }
 
 /**
- * Tiny module-level pub/sub so every `RangeGauge` cell can publish "I'm
- * hovered/tapped" without each one owning React state — with 30+ gauges on
- * screen, per-cell state would mean 30+ components re-rendering on mount
- * just to wire up handlers. Only the single `RangeTooltipHost` subscriber
- * re-renders, and only while something is actually active.
+ * Tiny module-level pub/sub so any cell (range gauge, working-close-order,
+ * ...) can publish "I'm hovered/tapped" without each one owning React state
+ * — with 30+ cells on screen, per-cell state would mean 30+ components
+ * re-rendering on mount just to wire up handlers. Only the single
+ * `CellTooltipHost` subscriber re-renders, and only while something is
+ * actually active. Shared across cell types so at most one tooltip is ever
+ * open at a time — publishing from a new cell simply replaces whatever was
+ * showing.
  */
-let rangeTooltipListener: ((data: RangeTooltipData | null) => void) | null = null;
-function publishRangeTooltip(data: RangeTooltipData | null) {
-    rangeTooltipListener?.(data);
+let cellTooltipListener: ((data: CellTooltipData | null) => void) | null = null;
+function publishCellTooltip(data: CellTooltipData | null) {
+    cellTooltipListener?.(data);
 }
 
 /**
- * Single shared tooltip node for every `RangeGauge` in the table — mounted
- * once (in `TradesTable`), positioned via `position: fixed` against the
- * hovered/tapped gauge's bounding rect so it always escapes the table's
+ * Single shared tooltip node for every tooltip-bearing cell in the table —
+ * mounted once (in `TradesTable`), positioned via `position: fixed` against
+ * the hovered/tapped cell's bounding rect so it always escapes the table's
  * `overflow-x: auto` scroll clipping regardless of which row it's in.
  * Renders null (no DOM) when nothing is active. On touch devices a tap on
- * any gauge opens it (see `RangeGauge`); tapping anywhere else closes it.
+ * any trigger opens it; tapping anywhere else closes it.
  */
-function RangeTooltipHost() {
-    const [data, setData] = useState<RangeTooltipData | null>(null);
+function CellTooltipHost() {
+    const [data, setData] = useState<CellTooltipData | null>(null);
 
     useEffect(() => {
-        rangeTooltipListener = setData;
+        cellTooltipListener = setData;
         return () => {
-            rangeTooltipListener = null;
+            cellTooltipListener = null;
         };
     }, []);
 
     useEffect(() => {
         if (!data) return;
-        // A click on a *different* gauge (or the same one again) bubbles past
+        // A click on a *different* trigger (or the same one again) bubbles past
         // this same click event all the way to `document` — React's synthetic
         // stopPropagation only stops other React handlers, not a raw
         // `addEventListener` listener further up the real DOM tree — so
-        // without the `[data-range-gauge]` check below, that click's own
-        // `publishRangeTooltip` call (which runs first, lower in the tree,
-        // via `RangeGauge`'s own onClick) would immediately be undone by this
+        // without the `[data-cell-tooltip]` check below, that click's own
+        // `publishCellTooltip` call (which runs first, lower in the tree, via
+        // the trigger's own onClick) would immediately be undone by this
         // handler closing it right back out in the same event. Only close
-        // when the click landed outside any gauge entirely. `click` (not
+        // when the click landed outside any trigger entirely. `click` (not
         // `touchstart`) is used so this also closes on mouse clicks (e.g. a
         // tooltip left open on desktop by a prior tap/click elsewhere).
         const close = (e: Event) => {
             const target = e.target as Element | null;
-            if (target?.closest('[data-range-gauge]')) return;
+            if (target?.closest('[data-cell-tooltip]')) return;
             setData(null);
         };
         document.addEventListener('click', close);
@@ -233,25 +239,7 @@ function RangeTooltipHost() {
     }, [data]);
 
     if (!data) return null;
-    const { price, low, high, anchor, expirations } = data;
-
-    const breachedLow = price <= low;
-    const breachedHigh = price >= high;
-    const itmPct = breachedLow
-        ? ((low - price) / low) * 100
-        : breachedHigh
-            ? ((price - high) / high) * 100
-            : null;
-
-    const rows: { label: string; value: string }[] = [
-        { label: 'Underlying', value: price.toFixed(2) },
-        { label: 'Lower Strike', value: String(low) },
-        { label: 'Upper Strike', value: String(high) },
-    ];
-    if (itmPct != null) rows.push({ label: 'ITM %', value: `${formatItmPct(itmPct)}%` });
-    expirations?.forEach((e) => {
-        rows.push({ label: 'Expiration', value: `${formatDate(e.date)}${e.dte != null ? ` (${e.dte}d)` : ''}` });
-    });
+    const { rows, anchor, width = 190 } = data;
 
     return (
         <div
@@ -265,7 +253,7 @@ function RangeTooltipHost() {
                 transform: 'translate(-50%, -100%)',
                 border: '1px solid var(--color-border)',
                 color: 'var(--color-text-primary)',
-                width: 190,
+                width,
                 pointerEvents: 'none',
             }}
         >
@@ -281,13 +269,36 @@ function RangeTooltipHost() {
     );
 }
 
+/** Shared hover/tap wiring for any cell that publishes to `CellTooltipHost`. Attach the returned handlers to the trigger element, and spread `data-cell-tooltip=""` on it too. */
+function useCellTooltip(buildRows: () => CellTooltipRow[], width?: number) {
+    const publish = (rect: DOMRect) => {
+        publishCellTooltip({ rows: buildRows(), anchor: { top: rect.top, left: rect.left, width: rect.width }, width });
+    };
+    return {
+        onMouseEnter: (e: React.MouseEvent<HTMLElement>) => publish(e.currentTarget.getBoundingClientRect()),
+        onMouseLeave: () => publishCellTooltip(null),
+        // Touch devices have no hover state — a tap opens the tooltip instead.
+        // `onClick` (not `onTouchStart`) is used because it's what every mobile
+        // browser reliably synthesizes from a tap — `touchstart` alone can be
+        // swallowed by the browser's own scroll/zoom gesture disambiguation on
+        // an element with no other native interactivity. `CellTooltipHost`
+        // closes it on a click outside any trigger, or on scroll (see the
+        // `data-cell-tooltip` check there — a click on this same trigger, or a
+        // different one, must not immediately close what it just opened).
+        onClick: (e: React.MouseEvent<HTMLElement>) => {
+            e.stopPropagation();
+            publish(e.currentTarget.getBoundingClientRect());
+        },
+    };
+}
+
 /**
  * Gradient gauge: shows the underlying price's position relative to the two
  * inner strikes bounding this strategy. Filled track between the strikes
  * gradients green (safe, centered) to red (near/at a strike); a dot marks
  * the live price. Padding on either side of the strikes gives the dot room
  * to show outside the band when price has moved beyond a strike. Hovering
- * publishes to the shared `RangeTooltipHost` (see above) rather than
+ * publishes to the shared `CellTooltipHost` (see above) rather than
  * rendering its own tooltip, so only one tooltip DOM node ever exists.
  */
 function RangeGauge({
@@ -324,30 +335,32 @@ function RangeGauge({
     const tickTop = height / 2 - 6;
     const dotSize = Math.max(9, height * 0.56);
 
-    const publish = (rect: DOMRect) => {
-        publishRangeTooltip({ price, low, high, anchor: { top: rect.top, left: rect.left, width: rect.width }, expirations });
+    const buildRows = (): CellTooltipRow[] => {
+        const breachedLow = price <= low;
+        const breachedHigh = price >= high;
+        const itmPct = breachedLow
+            ? ((low - price) / low) * 100
+            : breachedHigh
+                ? ((price - high) / high) * 100
+                : null;
+
+        const rows: CellTooltipRow[] = [
+            { label: 'Underlying', value: price.toFixed(2) },
+            { label: 'Lower Strike', value: String(low) },
+            { label: 'Upper Strike', value: String(high) },
+        ];
+        if (itmPct != null) rows.push({ label: 'ITM %', value: `${formatItmPct(itmPct)}%` });
+        expirations?.forEach((e) => {
+            rows.push({ label: 'Expiration', value: `${formatDate(e.date)}${e.dte != null ? ` (${e.dte}d)` : ''}` });
+        });
+        return rows;
     };
-    const handleEnter = (e: React.MouseEvent<HTMLSpanElement>) => publish(e.currentTarget.getBoundingClientRect());
-    const handleLeave = () => publishRangeTooltip(null);
-    // Touch devices have no hover state — a tap opens the tooltip instead.
-    // `onClick` (not `onTouchStart`) is used because it's what every mobile
-    // browser reliably synthesizes from a tap — `touchstart` alone can be
-    // swallowed by the browser's own scroll/zoom gesture disambiguation on
-    // an element with no other native interactivity. `RangeTooltipHost`
-    // closes it on a click outside any gauge, or on scroll (see the
-    // `data-range-gauge` check there — a click on this same gauge, or a
-    // different one, must not immediately close what it just opened).
-    const handleClick = (e: React.MouseEvent<HTMLSpanElement>) => {
-        e.stopPropagation();
-        publish(e.currentTarget.getBoundingClientRect());
-    };
+    const tooltip = useCellTooltip(buildRows, 190);
 
     return (
         <span
-            data-range-gauge=""
-            onMouseEnter={handleEnter}
-            onMouseLeave={handleLeave}
-            onClick={handleClick}
+            data-cell-tooltip=""
+            {...tooltip}
             style={{ position: 'relative', display: 'inline-block', width, height, verticalAlign: 'middle', touchAction: 'manipulation' }}
         >
             <span
@@ -373,6 +386,54 @@ function RangeGauge({
                     borderRadius: '50%', background: dotColor, border: '2px solid var(--color-surface)',
                 }}
             />
+        </span>
+    );
+}
+
+const LEG_INSTRUCTION_LABELS: Record<string, string> = {
+    BUY_TO_CLOSE: 'BTC',
+    SELL_TO_CLOSE: 'STC',
+};
+
+/** "11/20 560P" style short leg label for the tooltip. */
+function legShortLabel(leg: WorkingCloseOrder['legs'][number]): string {
+    const [, month, day] = leg.expiration.split('-');
+    return `${leg.underlying} ${month}/${day} ${leg.strike}${leg.right === 'CALL' ? 'C' : 'P'}`;
+}
+
+/** The "close order at 25% ($215)" cell shown in the Close column for an open trade with a matched working close order. */
+function CloseOrderCell({ order }: { order: WorkingCloseOrder }) {
+    const color = order.estPnl > 0 ? 'var(--color-success)' : order.estPnl < 0 ? 'var(--color-danger)' : undefined;
+
+    // Schwab's `price` on a multi-leg order is an unsigned magnitude for the
+    // whole combo — direction comes from `orderType` (NET_CREDIT/NET_DEBIT),
+    // never the sign of `price` itself.
+    const direction = order.orderType === 'NET_CREDIT' ? 'credit' : order.orderType === 'NET_DEBIT' ? 'debit' : '';
+    const buildRows = (): CellTooltipRow[] => {
+        const rows: CellTooltipRow[] = [
+            { label: 'Type', value: `${order.orderType ?? 'Limit'}${order.duration ? ` (${order.duration})` : ''}` },
+            { label: 'Limit Price', value: order.price != null ? `${formatCurrency(order.price)}${direction ? ` ${direction}` : ''}` : '—' },
+            { label: 'Entered', value: order.enteredTime ? new Date(order.enteredTime).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—' },
+        ];
+        order.legs.forEach((leg, i) => {
+            rows.push({ label: i === 0 ? 'Legs' : '', value: `${LEG_INSTRUCTION_LABELS[leg.instruction] ?? leg.instruction} ${legShortLabel(leg)}` });
+        });
+        rows.push({ label: 'Est. P&L', value: `${formatCurrency(order.estPnl, { sign: true })} (${order.estPctGain >= 0 ? '+' : ''}${order.estPctGain.toFixed(0)}%)` });
+        return rows;
+    };
+    const tooltip = useCellTooltip(buildRows, 220);
+
+    return (
+        <span
+            data-cell-tooltip=""
+            {...tooltip}
+            className="tabular-nums cursor-default"
+            style={{ touchAction: 'manipulation' }}
+        >
+            closing @
+            <span className="text-xs" style={{ color }}>
+                {order.estPctGain.toFixed(0)}% ({formatCurrency(order.estPnl)})
+            </span>
         </span>
     );
 }
@@ -545,6 +606,10 @@ const columns: ColumnDef<StrategyTrade>[] = [
         accessorKey: 'closeNet',
         header: 'Close',
         cell: (ctx) => {
+            const trade = ctx.row.original;
+            if (trade.status === 'open' && trade.workingCloseOrder) {
+                return <CloseOrderCell order={trade.workingCloseOrder} />;
+            }
             const v = ctx.getValue<number | undefined>();
             return <span className="tabular-nums">{v == null ? '—' : formatCurrency(v, { sign: true })}</span>;
         },
@@ -790,7 +855,7 @@ export function TradesTable({ trades, statusFilter }: { trades: StrategyTrade[];
 
     return (
         <div className="flex flex-col gap-3">
-            <RangeTooltipHost />
+            <CellTooltipHost />
             {/* Toolbar */}
             <div className="hidden sm:flex flex-wrap items-center gap-3">
                 <input

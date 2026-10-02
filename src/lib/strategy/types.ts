@@ -175,6 +175,31 @@ export interface StrategyTrade {
      * the UI.
      */
     underlyingPrice?: number;
+
+    /**
+     * A still-working (pending) order found on the broker to close this
+     * position, matched by leg (right/strike/expiration) rather than order
+     * id — the closing order is a fresh Schwab order, unrelated to
+     * `openOrderId`. Only populated for open trades; see
+     * `attachWorkingCloseOrders` in transactions/service.ts.
+     */
+    workingCloseOrder?: WorkingCloseOrder;
+}
+
+/** A pending broker order that would close an open trade, if filled. */
+export interface WorkingCloseOrder {
+    orderId: string;
+    /** Limit price per spread (not multiplied by contracts). */
+    price?: number;
+    orderType?: string;
+    duration?: string;
+    /** ISO-8601 instant the order was entered. */
+    enteredTime?: string;
+    legs: { instruction: string; right: OptionRight; strike: number; expiration: string; underlying: string }[];
+    /** Estimated P&L if this order fills at its limit price, using the trade's openNet as cost basis. */
+    estPnl: number;
+    /** estPnl / |openNet| as a percentage. */
+    estPctGain: number;
 }
 
 export interface StrategyMetrics {
