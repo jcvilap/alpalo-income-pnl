@@ -881,15 +881,25 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
     const spreadQuantity = trade.contracts ?? 1;
     const rawPrice = Math.abs(closeNet) / spreadQuantity / 100;
     // Schwab rejects a limit price with more than 2 decimal places (confirmed
-    // live: a raw per-spread price like 36.81888 comes back REJECTED) — round
-    // to whole cents, and round in whichever direction is at least as
-    // favorable to the target gain rather than naively to nearest: credit
-    // orders round UP (ask for slightly more than the exact target so the
-    // realized gain is never short of pctGain once filled), debit orders
-    // round DOWN (offer to pay slightly less).
-    const price = orderType === 'NET_CREDIT'
-        ? Math.ceil(rawPrice * 100) / 100
-        : Math.floor(rawPrice * 100) / 100;
+    // live: a raw per-spread price like 36.81888 comes back REJECTED), and
+    // separately rejects a broad-based index spread (SPX/RUT/NDX/VIX, same
+    // root set as `INDEX_QUOTE_SYMBOLS`) priced off a 5-cent increment
+    // ("Spread orders for SPX options must be priced in 5-cent increments" —
+    // confirmed live). Equity/ETF underlyings (QQQ, SPY, ...) have no such
+    // restriction and accept any 1-cent increment. Round to whichever tick
+    // size applies, and in whichever direction is at least as favorable to
+    // the target gain rather than naively to nearest: credit orders round UP
+    // (ask for slightly more than the exact target so the realized gain is
+    // never short of pctGain once filled), debit orders round DOWN (offer to
+    // pay slightly less).
+    const tick = trade.underlying in INDEX_QUOTE_SYMBOLS ? 0.05 : 0.01;
+    // Round to the nearest cent after the tick-size division/multiplication
+    // — floating-point arithmetic on 0.05 steps can otherwise land on
+    // something like 36.650000000000006, which is itself a >2-decimal price
+    // Schwab would reject right back.
+    const price = Math.round((orderType === 'NET_CREDIT'
+        ? Math.ceil(rawPrice / tick) * tick
+        : Math.floor(rawPrice / tick) * tick) * 100) / 100;
 
     const orderLegCollection = openLegs.map(leg => ({
         // Closing instruction is the opposite action of how the leg was
@@ -900,12 +910,25 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
         instrument: { symbol: leg.symbol!, assetType: 'OPTION' as const },
     }));
 
+    // Schwab labels both double calendars and double diagonals the same way
+    // — `DOUBLE_DIAGONAL` (confirmed against this account's own manually-
+    // placed working orders; Schwab's taxonomy doesn't distinguish a
+    // calendar as its own complex type, since it's just a diagonal with
+    // matching strikes). But that label only fits a genuine 4-leg order — a
+    // trade whose call-side or put-side half already closed independently
+    // (see `closeDoubleHalf` in pairing.ts) stays `status: 'open'` with just
+    // the other 2-leg half remaining, and the take-profit UI still offers it
+    // for that trade. Labeling a 2-leg order `DOUBLE_DIAGONAL` would send
+    // Schwab a shape mismatch it can reject, so fall back to `CUSTOM` (which
+    // Schwab accepts for any leg combination) whenever there aren't exactly
+    // 4 legs to close (Codex's PR #15 review).
+    const complexOrderStrategyType: 'DOUBLE_DIAGONAL' | 'CUSTOM' = openLegs.length === 4 ? 'DOUBLE_DIAGONAL' : 'CUSTOM';
     const orderRequest = {
         orderType,
         session: 'NORMAL' as const,
         duration: 'GOOD_TILL_CANCEL' as const,
         orderStrategyType: 'SINGLE' as const,
-        complexOrderStrategyType: 'CUSTOM' as const,
+        complexOrderStrategyType,
         price,
         orderLegCollection,
     };
