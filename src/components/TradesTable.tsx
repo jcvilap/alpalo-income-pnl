@@ -464,11 +464,15 @@ function remainingDte(expiration: string): number | undefined {
 /** Take-profit % stops offered in the row actions menu, 10%–50% in 5% steps. */
 const TAKE_PROFIT_PERCENTS = [10, 15, 20, 25, 30, 35, 40, 45, 50];
 
+/** Which confirm screen the menu is showing, if any. */
+type PendingAction = { type: 'cancel' } | { type: 'take-profit'; pct: number };
+
 /**
- * Row actions menu ("..."), one per trade. Today's only live action is
- * canceling a trade's working closing order (if it has one); the take-profit
- * presets are disabled placeholders for a future change that will cancel any
- * existing order and place a new take-profit order at that %.
+ * Row actions menu ("..."), one per trade. Live actions: canceling a trade's
+ * working closing order (if it has one), and setting a take-profit GTC limit
+ * order at a chosen % gain (10–50%, 5% steps) — which replaces any existing
+ * working close order in place (Schwab's atomic PUT) rather than canceling
+ * and placing separately, or places a fresh order if none exists.
  *
  * Positioned `fixed` against the trigger button's own rect (not the table
  * row) and rendered through a portal straight into `document.body` — the
@@ -483,16 +487,21 @@ const TAKE_PROFIT_PERCENTS = [10, 15, 20, 25, 30, 35, 40, 45, 50];
  */
 function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancelled: () => void }) {
     const [open, setOpen] = useState(false);
-    const [confirming, setConfirming] = useState(false);
+    const [confirming, setConfirming] = useState<PendingAction | null>(null);
     const [pending, setPending] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [anchor, setAnchor] = useState<{ top: number; left: number; width: number } | null>(null);
 
     const closingOrder = trade.status === 'open' ? trade.workingCloseOrder : undefined;
+    // Take-profit only supports whole-position, single-opening-order
+    // strategies that `setTakeProfitOrder` (service.ts) knows how to rebuild
+    // a closing order for — see TAKE_PROFIT_STRATEGIES there.
+    const supportsTakeProfit = trade.status === 'open'
+        && (trade.strategy === 'DOUBLE_CALENDAR' || trade.strategy === 'DOUBLE_DIAGONAL');
 
     const close = () => {
         setOpen(false);
-        setConfirming(false);
+        setConfirming(null);
         setError(null);
     };
 
@@ -534,6 +543,25 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
         }
     };
 
+    const handleSetTakeProfit = async (pct: number) => {
+        setPending(true);
+        setError(null);
+        try {
+            const res = await fetch(`/api/trades/${trade.openOrderId}/take-profit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pctGain: pct }),
+            });
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+            close();
+            onCancelled();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setPending(false);
+        }
+    };
+
     return (
         <span data-row-actions-menu="" style={{ position: 'relative', display: 'inline-block' }}>
             <button
@@ -564,7 +592,11 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                     {confirming ? (
                         <div className="px-3 py-2 flex flex-col gap-2">
                             <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                                Cancel this closing order on Schwab?
+                                {confirming.type === 'cancel'
+                                    ? 'Cancel this closing order on Schwab?'
+                                    : closingOrder
+                                        ? `Replace the working closing order with a take-profit limit at ${confirming.pct}% gain?`
+                                        : `Place a take-profit limit order at ${confirming.pct}% gain?`}
                             </span>
                             {error && (
                                 <span className="text-xs" style={{ color: 'var(--color-danger)' }}>
@@ -574,7 +606,7 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                             <div className="flex items-center gap-2 justify-end">
                                 <button
                                     type="button"
-                                    onClick={() => { setConfirming(false); setError(null); }}
+                                    onClick={() => { setConfirming(null); setError(null); }}
                                     disabled={pending}
                                     className="rounded-md px-2 py-1 text-xs font-medium disabled:opacity-60"
                                     style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}
@@ -583,12 +615,14 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={handleCancelOrder}
+                                    onClick={() => confirming.type === 'cancel' ? handleCancelOrder() : handleSetTakeProfit(confirming.pct)}
                                     disabled={pending}
                                     className="rounded-md px-2 py-1 text-xs font-medium text-white disabled:opacity-60"
-                                    style={{ background: 'var(--color-danger)' }}
+                                    style={{ background: confirming.type === 'cancel' ? 'var(--color-danger)' : 'var(--color-primary)' }}
                                 >
-                                    {pending ? 'Canceling…' : 'Yes, cancel'}
+                                    {pending
+                                        ? (confirming.type === 'cancel' ? 'Canceling…' : 'Submitting…')
+                                        : (confirming.type === 'cancel' ? 'Yes, cancel' : (closingOrder ? 'Yes, replace' : 'Yes, place order'))}
                                 </button>
                             </div>
                         </div>
@@ -598,7 +632,7 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                                 type="button"
                                 role="menuitem"
                                 disabled={!closingOrder}
-                                onClick={() => setConfirming(true)}
+                                onClick={() => setConfirming({ type: 'cancel' })}
                                 className="block w-full text-left px-3 py-1.5 truncate disabled:opacity-40 hover:opacity-80 disabled:hover:opacity-40"
                                 style={{ cursor: closingOrder ? 'pointer' : 'not-allowed' }}
                                 title={closingOrder ? undefined : 'No closing order on this trade'}
@@ -611,10 +645,11 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                                     key={pct}
                                     type="button"
                                     role="menuitem"
-                                    disabled
-                                    title="Coming soon"
-                                    className="block w-full text-left px-3 py-1.5 truncate opacity-40"
-                                    style={{ cursor: 'not-allowed' }}
+                                    disabled={!supportsTakeProfit}
+                                    onClick={() => setConfirming({ type: 'take-profit', pct })}
+                                    title={supportsTakeProfit ? undefined : 'Only available for open double calendar/diagonal trades'}
+                                    className="block w-full text-left px-3 py-1.5 truncate disabled:opacity-40 hover:opacity-80 disabled:hover:opacity-40"
+                                    style={{ cursor: supportsTakeProfit ? 'pointer' : 'not-allowed' }}
                                 >
                                     Set take profit @{pct}%
                                 </button>
