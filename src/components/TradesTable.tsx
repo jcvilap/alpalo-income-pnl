@@ -465,7 +465,10 @@ function remainingDte(expiration: string): number | undefined {
 const TAKE_PROFIT_PERCENTS = [10, 15, 20, 25, 30, 35, 40, 45, 50];
 
 /** Which confirm screen the menu is showing, if any. */
-type PendingAction = { type: 'cancel' } | { type: 'take-profit'; pct: number };
+type PendingAction = { type: 'cancel' } | { type: 'take-profit'; pct: number } | { type: 'close-at-market' };
+
+/** Rough upper bound on the non-confirming menu's full height (cancel + 9 take-profit stops + close-at-market, each ~30px, plus two separators and padding) — used to decide whether it should open upward instead of downward. The menu itself caps at this height and scrolls if the actual content is taller, so an under-estimate only costs an unnecessary scrollbar, never a flip the wrong way. */
+const MENU_MAX_HEIGHT = 420;
 
 /**
  * Row actions menu ("..."), one per trade. Live actions: canceling a trade's
@@ -490,7 +493,7 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
     const [confirming, setConfirming] = useState<PendingAction | null>(null);
     const [pending, setPending] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [anchor, setAnchor] = useState<{ top: number; left: number; width: number } | null>(null);
+    const [anchor, setAnchor] = useState<{ top: number; bottom: number; left: number; width: number } | null>(null);
 
     const closingOrder = trade.status === 'open' ? trade.workingCloseOrder : undefined;
     // Take-profit only supports whole-position, single-opening-order
@@ -523,7 +526,7 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
             return;
         }
         const rect = e.currentTarget.getBoundingClientRect();
-        setAnchor({ top: rect.bottom, left: rect.right, width: rect.width });
+        setAnchor({ top: rect.bottom, bottom: rect.top, left: rect.right, width: rect.width });
         setOpen(true);
     };
 
@@ -562,6 +565,21 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
         }
     };
 
+    const handleCloseAtMarket = async () => {
+        setPending(true);
+        setError(null);
+        try {
+            const res = await fetch(`/api/trades/${trade.openOrderId}/close-at-market`, { method: 'POST' });
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+            close();
+            onCancelled();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setPending(false);
+        }
+    };
+
     return (
         <span data-row-actions-menu="" style={{ position: 'relative', display: 'inline-block' }}>
             <button
@@ -581,7 +599,18 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                     style={{
                         position: 'fixed',
                         zIndex: 50,
-                        top: anchor.top + 4,
+                        // Flip upward (anchor to the button's top, grow
+                        // toward the top of the viewport) when there isn't
+                        // enough room below for the full menu — the
+                        // non-confirming menu is tall (cancel + 9 take-profit
+                        // stops + close-at-market) and otherwise ran off the
+                        // bottom of the screen for any row in the lower half
+                        // of a normal-height viewport, with no way to reach
+                        // its last items.
+                        ...(anchor.top + MENU_MAX_HEIGHT > window.innerHeight && anchor.bottom > MENU_MAX_HEIGHT
+                            ? { bottom: window.innerHeight - anchor.bottom + 4, maxHeight: anchor.bottom - 8 }
+                            : { top: anchor.top + 4, maxHeight: window.innerHeight - anchor.top - 8 }),
+                        overflowY: 'auto',
                         left: anchor.left,
                         transform: 'translateX(-100%)',
                         border: '1px solid var(--color-border)',
@@ -594,9 +623,13 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                             <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
                                 {confirming.type === 'cancel'
                                     ? 'Cancel this closing order on Schwab?'
-                                    : closingOrder
-                                        ? `Replace the working closing order with a take-profit limit at ${confirming.pct}% gain?`
-                                        : `Place a take-profit limit order at ${confirming.pct}% gain?`}
+                                    : confirming.type === 'close-at-market'
+                                        ? (closingOrder
+                                            ? 'Replace the working closing order with a limit order at the current mid price?'
+                                            : 'Place a limit order to close at the current mid price?')
+                                        : closingOrder
+                                            ? `Replace the working closing order with a take-profit limit at ${confirming.pct}% gain?`
+                                            : `Place a take-profit limit order at ${confirming.pct}% gain?`}
                             </span>
                             {error && (
                                 <span className="text-xs" style={{ color: 'var(--color-danger)' }}>
@@ -615,7 +648,11 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={() => confirming.type === 'cancel' ? handleCancelOrder() : handleSetTakeProfit(confirming.pct)}
+                                    onClick={() => {
+                                        if (confirming.type === 'cancel') handleCancelOrder();
+                                        else if (confirming.type === 'close-at-market') handleCloseAtMarket();
+                                        else handleSetTakeProfit(confirming.pct);
+                                    }}
                                     disabled={pending}
                                     className="rounded-md px-2 py-1 text-xs font-medium text-white disabled:opacity-60"
                                     style={{ background: confirming.type === 'cancel' ? 'var(--color-danger)' : 'var(--color-primary)' }}
@@ -638,6 +675,17 @@ function RowActionsMenu({ trade, onCancelled }: { trade: StrategyTrade; onCancel
                                 title={closingOrder ? undefined : 'No closing order on this trade'}
                             >
                                 Cancel closing order
+                            </button>
+                            <button
+                                type="button"
+                                role="menuitem"
+                                disabled={!supportsTakeProfit}
+                                onClick={() => setConfirming({ type: 'close-at-market' })}
+                                title={supportsTakeProfit ? undefined : 'Only available for open double calendar/diagonal trades'}
+                                className="block w-full text-left px-3 py-1.5 truncate disabled:opacity-40 hover:opacity-80 disabled:hover:opacity-40"
+                                style={{ cursor: supportsTakeProfit ? 'pointer' : 'not-allowed' }}
+                            >
+                                Close at current price
                             </button>
                             <div className="my-1" style={{ borderTop: '1px solid var(--color-border-light)' }} />
                             {TAKE_PROFIT_PERCENTS.map((pct) => (

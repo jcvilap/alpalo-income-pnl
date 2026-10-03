@@ -827,27 +827,9 @@ const TAKE_PROFIT_STRATEGIES: StrategyId[] = ['DOUBLE_CALENDAR', 'DOUBLE_DIAGONA
 
 export class TakeProfitError extends Error {}
 
-/**
- * Place (or replace) a GTC limit order that closes every still-open leg of
- * the trade identified by `openOrderId`, targeting a `pctGain`% realized gain
- * — i.e. `closeNet` such that `(openNet + closeNet) / |openNet| * 100 ===
- * pctGain`. Re-derives the trade fresh from `getTrades` rather than trusting
- * a client-supplied leg list, so a caller can't dictate arbitrary order legs/
- * prices on a real brokerage account — only a `pctGain` number crosses the
- * API boundary.
- *
- * If the trade already has a working close order (`workingCloseOrder`),
- * replaces it in place via Schwab's PUT endpoint (atomic cancel+place, no
- * window with neither order working) rather than issuing a separate
- * cancel-then-place. Otherwise places a brand-new order.
- */
-export async function setTakeProfitOrder(openOrderId: string, pctGain: number): Promise<{ orderId?: string; replaced: boolean }> {
-    if (!Number.isFinite(pctGain) || pctGain <= 0) {
-        throw new TakeProfitError(`Invalid take-profit percent: ${pctGain}`);
-    }
-
+/** Fetch the trade identified by `openOrderId` among open double calendar/diagonal positions, re-derived fresh rather than trusting any client-supplied leg list. */
+async function getOpenDoubleTrade(openOrderId: string): Promise<{ account: AccountConfig; trade: StrategyTrade }> {
     const account = firstSchwabAccount();
-    const hash = account.accountIdKey ?? account.key;
     const to = new Date().toISOString();
     const from = clampLookback(to);
 
@@ -856,22 +838,26 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
     if (!trade) {
         throw new TakeProfitError(`No open trade found for order ${openOrderId}`);
     }
+    return { account, trade };
+}
 
+/**
+ * Build the Schwab multi-leg order request that closes every still-open leg
+ * of `trade` at the given signed `closeNet` (positive = net credit received,
+ * negative = net debit paid), then place it fresh or replace the trade's
+ * existing working close order in place (Schwab's atomic PUT — no window
+ * with neither order working) — shared by `setTakeProfitOrder` (closeNet
+ * solved from a target % gain) and `closeAtMarketOrder` (closeNet read
+ * straight off live bid/ask mids).
+ */
+async function submitCloseOrder(client: SchwabClient, trade: StrategyTrade, closeNet: number): Promise<{ orderId?: string; replaced: boolean }> {
     const openLegs = trade.legs.filter(l => l.openClose === 'OPEN');
     if (openLegs.length === 0) {
-        throw new TakeProfitError(`Trade ${openOrderId} has no open legs to close`);
+        throw new TakeProfitError(`Trade ${trade.openOrderId} has no open legs to close`);
     }
     if (openLegs.some(l => !l.symbol)) {
-        throw new TakeProfitError(`Trade ${openOrderId} is missing an option symbol on one or more legs`);
+        throw new TakeProfitError(`Trade ${trade.openOrderId} is missing an option symbol on one or more legs`);
     }
-
-    // Solve for closeNet given the target pctGain: pnl = openNet + closeNet,
-    // pctGain = pnl / |openNet| * 100 (see StrategyTrade.pctGain's own
-    // definition, which this mirrors so "take profit @20%" means exactly what
-    // the dashboard's %Gain column would show once this order fills).
-    const openNet = trade.openNet;
-    const targetPnl = (pctGain / 100) * Math.abs(openNet);
-    const closeNet = targetPnl - openNet;
 
     // Schwab's multi-leg price is a positive per-spread magnitude with
     // direction carried separately by orderType — a positive closeNet (net
@@ -888,10 +874,9 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
     // confirmed live). Equity/ETF underlyings (QQQ, SPY, ...) have no such
     // restriction and accept any 1-cent increment. Round to whichever tick
     // size applies, and in whichever direction is at least as favorable to
-    // the target gain rather than naively to nearest: credit orders round UP
-    // (ask for slightly more than the exact target so the realized gain is
-    // never short of pctGain once filled), debit orders round DOWN (offer to
-    // pay slightly less).
+    // the target (credit orders round UP so the realized proceeds are never
+    // short of what was asked for once filled; debit orders round DOWN so
+    // the cost is never more than asked for).
     const tick = trade.underlying in INDEX_QUOTE_SYMBOLS ? 0.05 : 0.01;
     // Round to the nearest cent after the tick-size division/multiplication
     // — floating-point arithmetic on 0.05 steps can otherwise land on
@@ -901,7 +886,25 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
         ? Math.ceil(rawPrice / tick) * tick
         : Math.floor(rawPrice / tick) * tick) * 100) / 100;
 
-    const orderLegCollection = openLegs.map(leg => ({
+    // When replacing an existing working close order, Schwab's PUT endpoint
+    // is sensitive to leg order — confirmed live: a replace whose
+    // `orderLegCollection` legs were in a different order than the working
+    // order's own leg sequence came back "400 Order instruction cannot be
+    // replaced", even though the exact same leg set placed as a *new* order
+    // (no existing order to match against) succeeded every time. `trade.legs`
+    // has no guaranteed order of its own (see e.g. `dedupeLegsBySignature`'s
+    // own comment on this in pairing.ts), so reorder `openLegs` to match
+    // `trade.workingCloseOrder.legs`' own sequence — Schwab's canonical order
+    // for this exact working order — before building the replacement.
+    const orderedOpenLegs = trade.workingCloseOrder
+        ? [...openLegs].sort((a, b) => {
+              const sig = (l: typeof a) => `${l.right}:${l.strike}:${l.expiration}`;
+              const legOrder = trade.workingCloseOrder!.legs.map(l => `${l.right}:${l.strike}:${l.expiration}`);
+              return legOrder.indexOf(sig(a)) - legOrder.indexOf(sig(b));
+          })
+        : openLegs;
+
+    const orderLegCollection = orderedOpenLegs.map(leg => ({
         // Closing instruction is the opposite action of how the leg was
         // opened: a long (bought, quantity > 0) open leg closes by selling;
         // a short (sold, quantity < 0) open leg closes by buying back.
@@ -917,11 +920,11 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
     // matching strikes). But that label only fits a genuine 4-leg order — a
     // trade whose call-side or put-side half already closed independently
     // (see `closeDoubleHalf` in pairing.ts) stays `status: 'open'` with just
-    // the other 2-leg half remaining, and the take-profit UI still offers it
-    // for that trade. Labeling a 2-leg order `DOUBLE_DIAGONAL` would send
-    // Schwab a shape mismatch it can reject, so fall back to `CUSTOM` (which
-    // Schwab accepts for any leg combination) whenever there aren't exactly
-    // 4 legs to close (Codex's PR #15 review).
+    // the other 2-leg half remaining, and this action still offers it for
+    // that trade. Labeling a 2-leg order `DOUBLE_DIAGONAL` would send Schwab
+    // a shape mismatch it can reject, so fall back to `CUSTOM` (which Schwab
+    // accepts for any leg combination) whenever there aren't exactly 4 legs
+    // to close (Codex's PR #15 review).
     const complexOrderStrategyType: 'DOUBLE_DIAGONAL' | 'CUSTOM' = openLegs.length === 4 ? 'DOUBLE_DIAGONAL' : 'CUSTOM';
     const orderRequest = {
         orderType,
@@ -933,23 +936,95 @@ export async function setTakeProfitOrder(openOrderId: string, pctGain: number): 
         orderLegCollection,
     };
 
-    return withRedis(async (redis) => {
-        const client = new SchwabClient({
-            name: account.name,
-            clientId: account.key,
-            clientSecret: account.secret,
-            accessToken: account.accessToken,
-            refreshToken: account.refreshToken,
-            accountHash: account.accountIdKey,
-            redis,
-        });
+    if (trade.workingCloseOrder) {
+        await client.replaceOrder(trade.workingCloseOrder.orderId, orderRequest);
+        return { replaced: true };
+    }
+    await client.placeOptionOrder(orderRequest);
+    return { replaced: false };
+}
 
-        if (trade.workingCloseOrder) {
-            await client.replaceOrder(trade.workingCloseOrder.orderId, orderRequest);
-            return { replaced: true };
+/** Construct a `SchwabClient` for `account`, backed by `redis` for token persistence — shared setup for every action in this module that talks to Schwab's trading endpoints. */
+function schwabClientFor(account: AccountConfig, redis: RedisClientType): SchwabClient {
+    return new SchwabClient({
+        name: account.name,
+        clientId: account.key,
+        clientSecret: account.secret,
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken,
+        accountHash: account.accountIdKey,
+        redis,
+    });
+}
+
+/**
+ * Place (or replace) a GTC limit order that closes every still-open leg of
+ * the trade identified by `openOrderId`, targeting a `pctGain`% realized gain
+ * — i.e. `closeNet` such that `(openNet + closeNet) / |openNet| * 100 ===
+ * pctGain`.
+ */
+export async function setTakeProfitOrder(openOrderId: string, pctGain: number): Promise<{ orderId?: string; replaced: boolean }> {
+    if (!Number.isFinite(pctGain) || pctGain <= 0) {
+        throw new TakeProfitError(`Invalid take-profit percent: ${pctGain}`);
+    }
+
+    const { account, trade } = await getOpenDoubleTrade(openOrderId);
+
+    // Solve for closeNet given the target pctGain: pnl = openNet + closeNet,
+    // pctGain = pnl / |openNet| * 100 (see StrategyTrade.pctGain's own
+    // definition, which this mirrors so "take profit @20%" means exactly what
+    // the dashboard's %Gain column would show once this order fills).
+    const openNet = trade.openNet;
+    const targetPnl = (pctGain / 100) * Math.abs(openNet);
+    const closeNet = targetPnl - openNet;
+
+    return withRedis(redis => submitCloseOrder(schwabClientFor(account, redis), trade, closeNet));
+}
+
+/**
+ * Place (or replace) a GTC limit order that closes every still-open leg of
+ * the trade identified by `openOrderId` at the position's current live
+ * bid/ask mid price — a manual take-profit or stop-loss, closing out at
+ * whatever the market happens to be right now rather than a target % gain.
+ * `closeNet` is the signed sum of each leg's own mid-price cash (same sign
+ * convention as a realized `closeNet` elsewhere: positive = net credit
+ * received to close, negative = net debit paid), derived from live quotes
+ * rather than any client-supplied price.
+ */
+export async function closeAtMarketOrder(openOrderId: string): Promise<{ orderId?: string; replaced: boolean }> {
+    const { account, trade } = await getOpenDoubleTrade(openOrderId);
+    const openLegs = trade.legs.filter(l => l.openClose === 'OPEN');
+    if (openLegs.length === 0) {
+        throw new TakeProfitError(`Trade ${openOrderId} has no open legs to close`);
+    }
+    const symbols = openLegs.map(l => l.symbol).filter((s): s is string => !!s);
+    if (symbols.length !== openLegs.length) {
+        throw new TakeProfitError(`Trade ${openOrderId} is missing an option symbol on one or more legs`);
+    }
+
+    return withRedis(async (redis) => {
+        const client = schwabClientFor(account, redis);
+
+        const quotes = await client.getQuotes(symbols);
+        let closeNet = 0;
+        for (const leg of openLegs) {
+            const quote = quotes[leg.symbol!];
+            if (!quote || typeof quote.bidPrice !== 'number' || typeof quote.askPrice !== 'number') {
+                throw new TakeProfitError(`No live quote available for ${leg.symbol}`);
+            }
+            const mid = (quote.bidPrice + quote.askPrice) / 2;
+            // Closing a leg reverses its open delta: a long (quantity > 0)
+            // open leg closes by selling (cash = +quantity * mid * 100,
+            // since -(-quantity) = +quantity — see `legNetAmount`'s
+            // -quantity*price convention and `applyUnrealizedPnl`'s mirrored
+            // comment on this same sign flip); a short (quantity < 0) open
+            // leg closes by buying (cash = +quantity * mid * 100 is
+            // negative, i.e. a debit, exactly as buying back a short should
+            // be).
+            closeNet += leg.quantity * mid * 100;
         }
-        await client.placeOptionOrder(orderRequest);
-        return { replaced: false };
+
+        return submitCloseOrder(client, trade, closeNet);
     });
 }
 
